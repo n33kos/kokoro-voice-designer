@@ -1,0 +1,16 @@
+[project]
+name = "voice-designer"
+version = "0.1.0"
+description = "Interactive PCA-based voice designer with Gradio UI"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "gradio>=5.0",
+    "kokoro>=0.9.4",
+    "librosa>=0.10.2",
+    "numpy>=2.2.6",
+    "resemblyzer>=0.1.4",
+    "soundfile>=0.13.1",
+    "torch>=2.7.0",
+    "tqdm>=4.67.1",
+]
