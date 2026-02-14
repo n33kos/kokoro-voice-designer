@@ -1,3 +1,4 @@
+.DS_Store
 __pycache__/
 *.pyc
 .venv/
@@ -6,3 +7,11 @@ dist/
 build/
 .uv/
 uv.lock
+
+# Downloaded voices (re-fetched on first run)
+voices/
+_hf_cache/
+
+# Output files (designed voices, audio)
+output/*
+!output/.gitkeep
