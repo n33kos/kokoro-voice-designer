@@ -356,6 +356,7 @@ def run_analysis(base_voice_file, target_audio, target_text, target_text_file, v
             progress(0.22, desc=f"Could not load discoveries: {str(e)[:50]}")
 
     # Filter components based on user selection
+    component_source_changed = False
     if not use_pca and not use_discovery:
         raise gr.Error("Must select at least one component source (PCA or Discoveries).")
     elif use_pca and not use_discovery:
@@ -364,6 +365,8 @@ def run_analysis(base_voice_file, target_audio, target_text, target_text_file, v
         all_singular_values = analyzer.singular_values
         max_possible = min(len(voice_tensors) - 1, MAX_SLIDERS)
         n_active = min(n_requested, max_possible)
+        component_source_changed = _state.get("component_source") != "pca"
+        _state["component_source"] = "pca"
         progress(0.23, desc="Using PCA components only")
     elif use_discovery and not use_pca:
         # Discoveries only: use only discovered components
@@ -378,10 +381,18 @@ def run_analysis(base_voice_file, target_audio, target_text, target_text_file, v
         all_singular_values = torch.full((all_components.shape[0],), avg_sv)
         max_possible = min(all_components.shape[0], MAX_SLIDERS)
         n_active = min(n_requested, max_possible)
+        component_source_changed = _state.get("component_source") != "discovery"
+        _state["component_source"] = "discovery"
         progress(0.23, desc=f"Using {all_components.shape[0]} discovered components only")
     else:
         # Both sources: already mixed above
+        component_source_changed = _state.get("component_source") != "both"
+        _state["component_source"] = "both"
         progress(0.23, desc="Using PCA + discovered components")
+
+    # Clear sensitivity cache if component source changed to force re-analysis
+    if component_source_changed:
+        existing_sensitivity = {}
 
     # Compute component ranges for intuitive scaling
     n_voices = len(voice_tensors)
