@@ -774,8 +774,7 @@ def build_ui():
             with gr.Row():
                 discovery_file_input = gr.File(
                     label="Load Discovery Cache (.pt)",
-                    file_types=[".pt"],
-                    info="Upload a previously saved discovery_cache.pt file"
+                    file_types=[".pt"]
                 )
                 discovery_path_input = gr.Textbox(
                     label="Or enter cache path",
