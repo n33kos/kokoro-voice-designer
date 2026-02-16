@@ -264,19 +264,22 @@ def run_discovery(voice_folder, n_probes, progress=gr.Progress()):
     return summary
 
 
-def run_analysis(base_voice_file, target_audio, target_text, target_text_file, voice_folder, n_components, use_pca=True, use_discovery=True, progress=gr.Progress()):
-    """Load voices, build PCA, run sensitivity analysis.
+def run_analysis(base_voice_file, target_audio, target_text, target_text_file,
+                 voice_folder, pca_components, active_components,
+                 use_pca=True, use_discovery=True, progress=gr.Progress()):
+    """Load components from selected sources, run sensitivity analysis.
 
-    Incremental: if state already exists with sensitivity data, only analyzes new components.
-
-    Args:
-        use_pca: Whether to use PCA components
-        use_discovery: Whether to use discovered components
+    PCA is only computed when use_pca=True. Discoveries are loaded from
+    cache when use_discovery=True. The two counts are independent:
+    pca_components controls how many PCA directions to extract,
+    active_components controls how many sliders to show for tuning.
     """
     if base_voice_file is None:
         raise gr.Error("Please upload a base voice .pt file.")
     if target_audio is None:
         raise gr.Error("Please upload a target audio file.")
+    if not use_pca and not use_discovery:
+        raise gr.Error("Select at least one component source (PCA or Discoveries).")
 
     # Handle text from file or textbox
     if target_text_file:
@@ -288,125 +291,146 @@ def run_analysis(base_voice_file, target_audio, target_text, target_text_file, v
     if not voice_folder or not os.path.isdir(voice_folder):
         raise gr.Error(f"Voice folder not found: {voice_folder}")
 
-    n_requested = int(n_components)
+    n_active_requested = int(active_components)
 
-    # Check if we can reuse existing state (incremental expansion)
-    have_existing = "analyzer" in _state and "sensitivity" in _state
-    existing_sensitivity = _state.get("sensitivity", {})
+    # Detect component source change to invalidate sensitivity cache
+    if use_pca and use_discovery:
+        source_key = "both"
+    elif use_pca:
+        source_key = "pca"
+    else:
+        source_key = "discovery"
+    component_source_changed = _state.get("component_source") != source_key
+    _state["component_source"] = source_key
+
+    have_existing = "sensitivity" in _state and not component_source_changed
+    existing_sensitivity = _state.get("sensitivity", {}) if have_existing else {}
 
     progress(0.0, desc="Loading base voice...")
     base_voice = load_voice(base_voice_file)
+    voice_shape = base_voice.shape
 
-    # Load all .pt voices from folder
-    progress(0.05, desc="Loading voice library...")
-    voice_tensors = []
-    pt_files = sorted(f for f in os.listdir(voice_folder) if f.endswith(".pt"))
-    if len(pt_files) < 3:
-        raise gr.Error(f"Need at least 3 .pt files in {voice_folder}, found {len(pt_files)}")
-
-    for f in pt_files:
-        voice_tensors.append(load_voice(os.path.join(voice_folder, f)))
-
-    max_possible = min(len(voice_tensors) - 1, MAX_SLIDERS)
-    n_active = min(n_requested, max_possible)
-
-    # Reuse speech generator if available, otherwise create
-    if have_existing and "speech_gen" in _state:
-        progress(0.1, desc="Reusing Kokoro pipeline...")
+    # --- Reuse or create speech generator and fitness scorer ---
+    if "speech_gen" in _state:
+        progress(0.05, desc="Reusing Kokoro pipeline...")
         speech_gen = _state["speech_gen"]
     else:
-        progress(0.1, desc="Initializing Kokoro pipeline...")
+        progress(0.05, desc="Initializing Kokoro pipeline...")
         speech_gen = SpeechGenerator()
 
-    if have_existing and "fitness" in _state:
-        progress(0.15, desc="Reusing fitness scorer...")
+    if "fitness" in _state and not component_source_changed:
+        progress(0.1, desc="Reusing fitness scorer...")
         fitness = _state["fitness"]
     else:
-        progress(0.15, desc="Converting target audio...")
+        progress(0.1, desc="Converting target audio...")
         target_wav_path = convert_audio(target_audio)
         fitness = FitnessScorer(target_wav_path, device=speech_gen.device)
 
-    # PCA decomposition — always compute with max components for headroom
-    progress(0.2, desc=f"Running PCA ({max_possible} components)...")
-    analyzer = VoiceAnalyzer(voice_tensors, n_components=max_possible)
+    # --- Phase 1: Conditionally compute PCA ---
+    analyzer = None
+    pca_comps = None
+    pca_sv = None
+    per_component_variance = None
 
-    # Load discoveries if cache exists
-    discovery = DiscoveryAnalysis(OUTPUT_DIR)
-    all_components = analyzer.components
-    all_singular_values = analyzer.singular_values
-    discovery_cache_data = None
+    if use_pca:
+        progress(0.15, desc="Loading voice library for PCA...")
+        pt_files = sorted(f for f in os.listdir(voice_folder) if f.endswith(".pt"))
+        if len(pt_files) < 3:
+            raise gr.Error(f"Need at least 3 .pt files in {voice_folder}, found {len(pt_files)}")
 
-    if discovery.cache_exists():
-        try:
-            progress(0.22, desc="Loading discovery cache...")
-            discovery_cache_data = discovery.load_cache()
-            cache_voice_hash = discovery_cache_data.get("voice_hash")
-            current_voice_hash = discovery.compute_voice_hash(pt_files)
-            if cache_voice_hash == current_voice_hash:
-                discovered_components = discovery_cache_data.get("components")
-                if discovered_components is not None and discovered_components.shape[0] > 0:
-                    # Mix PCA + discoveries
-                    all_components = torch.cat([all_components, discovered_components], dim=0)
-                    # Extend singular values with average for discoveries
-                    avg_sv = analyzer.singular_values.mean()
-                    discovery_sv = torch.full((discovered_components.shape[0],), avg_sv)
-                    all_singular_values = torch.cat([all_singular_values, discovery_sv], dim=0)
-                    progress(0.23, desc=f"Loaded {discovered_components.shape[0]} discovered dimensions")
-        except Exception as e:
-            progress(0.22, desc=f"Could not load discoveries: {str(e)[:50]}")
+        voice_tensors = []
+        for f in pt_files:
+            voice_tensors.append(load_voice(os.path.join(voice_folder, f)))
 
-    # Filter components based on user selection
-    component_source_changed = False
-    if not use_pca and not use_discovery:
-        raise gr.Error("Must select at least one component source (PCA or Discoveries).")
-    elif use_pca and not use_discovery:
-        # PCA only: discard discoveries
-        all_components = analyzer.components
-        all_singular_values = analyzer.singular_values
-        max_possible = min(len(voice_tensors) - 1, MAX_SLIDERS)
-        n_active = min(n_requested, max_possible)
-        component_source_changed = _state.get("component_source") != "pca"
-        _state["component_source"] = "pca"
-        progress(0.23, desc="Using PCA components only")
-    elif use_discovery and not use_pca:
-        # Discoveries only: use only discovered components
-        if discovery_cache_data is None:
-            raise gr.Error("No discoveries cached. Run Discovery first or select PCA.")
-        discovered_components = discovery_cache_data.get("components")
-        if discovered_components is None or discovered_components.shape[0] == 0:
-            raise gr.Error("No discoveries found in cache. Run Discovery first or select PCA.")
-        all_components = discovered_components
-        D = int(torch.tensor(analyzer.voice_shape).prod().item())
-        avg_sv = analyzer.singular_values.mean()
-        all_singular_values = torch.full((all_components.shape[0],), avg_sv)
-        max_possible = min(all_components.shape[0], MAX_SLIDERS)
-        n_active = min(n_requested, max_possible)
-        component_source_changed = _state.get("component_source") != "discovery"
-        _state["component_source"] = "discovery"
-        progress(0.23, desc=f"Using {all_components.shape[0]} discovered components only")
+        n_pca_requested = int(pca_components)
+        max_pca = min(len(voice_tensors) - 1, MAX_SLIDERS)
+        n_pca = min(n_pca_requested, max_pca)
+
+        progress(0.2, desc=f"Running PCA ({n_pca} components from {len(voice_tensors)} voices)...")
+        analyzer = VoiceAnalyzer(voice_tensors, n_components=n_pca)
+        pca_comps = analyzer.components
+        pca_sv = analyzer.singular_values
+        per_component_variance = analyzer.per_component_variance
     else:
-        # Both sources: already mixed above
-        component_source_changed = _state.get("component_source") != "both"
-        _state["component_source"] = "both"
-        progress(0.23, desc="Using PCA + discovered components")
+        # Still need voice list filenames for discovery hash validation
+        pt_files = sorted(f for f in os.listdir(voice_folder) if f.endswith(".pt"))
 
-    # Clear sensitivity cache if component source changed to force re-analysis
-    if component_source_changed:
-        existing_sensitivity = {}
+    # --- Phase 2: Load discoveries if requested ---
+    discovery_cache_data = None
+    if use_discovery:
+        discovery = DiscoveryAnalysis(OUTPUT_DIR)
+        if discovery.cache_exists():
+            try:
+                progress(0.22, desc="Loading discovery cache...")
+                discovery_cache_data = discovery.load_cache()
+                # Validate voice hash
+                cache_voice_hash = discovery_cache_data.get("voice_hash")
+                current_voice_hash = discovery.compute_voice_hash(pt_files)
+                if cache_voice_hash != current_voice_hash:
+                    progress(0.22, desc="Discovery cache voice hash mismatch, ignoring...")
+                    discovery_cache_data = None
+            except Exception as e:
+                progress(0.22, desc=f"Could not load discoveries: {str(e)[:50]}")
+                discovery_cache_data = None
 
-    # Compute component ranges for intuitive scaling
-    n_voices = len(voice_tensors)
-    flat = torch.stack(voice_tensors).reshape(n_voices, -1).float()
-    centered = flat - analyzer.mean
-    projections = centered @ all_components.T
-    component_ranges = projections.max(dim=0).values - projections.min(dim=0).values
+    # --- Phase 3: Assemble available components ---
+    available_components = []
+    available_sv = []
 
-    # Determine which components still need sensitivity analysis
+    if use_pca and pca_comps is not None:
+        available_components.append(pca_comps)
+        available_sv.append(pca_sv)
+
+    if use_discovery and discovery_cache_data is not None:
+        discovered = discovery_cache_data.get("components")
+        if discovered is not None and discovered.shape[0] > 0:
+            available_components.append(discovered)
+            # Scale discoveries using PCA singular values if available, else default
+            avg_sv = pca_sv.mean() if pca_sv is not None else torch.tensor(1.0)
+            disc_sv = torch.full((discovered.shape[0],), float(avg_sv))
+            available_sv.append(disc_sv)
+            progress(0.23, desc=f"Loaded {discovered.shape[0]} discovered components")
+
+    if not available_components:
+        raise gr.Error("No components available. Check PCA voices or run Discovery first.")
+
+    all_components = torch.cat(available_components, dim=0)
+    all_singular_values = torch.cat(available_sv, dim=0)
+
+    # n_active is independent of PCA count
+    max_possible = min(all_components.shape[0], MAX_SLIDERS)
+    n_active = min(n_active_requested, max_possible)
+
+    # --- Phase 4: Compute component ranges ---
+    if use_pca and analyzer is not None:
+        # Project voice library onto all components for intuitive slider scaling
+        n_voices = len(voice_tensors)
+        flat = torch.stack(voice_tensors).reshape(n_voices, -1).float()
+        centered = flat - analyzer.mean
+        projections = centered @ all_components.T
+        component_ranges = projections.max(dim=0).values - projections.min(dim=0).values
+    else:
+        # Discovery-only: uniform scaling
+        component_ranges = torch.ones(all_components.shape[0])
+
+    # Build per_component_variance for slider labels
+    if per_component_variance is not None:
+        # Pad with zeros for discovery components
+        n_extra = all_components.shape[0] - len(per_component_variance)
+        if n_extra > 0:
+            per_component_variance = torch.cat([
+                per_component_variance,
+                torch.zeros(n_extra)
+            ])
+    else:
+        per_component_variance = torch.zeros(all_components.shape[0])
+
+    # --- Phase 5: Sensitivity analysis ---
     components_to_analyze = [i for i in range(n_active) if i not in existing_sensitivity]
     total_to_analyze = len(components_to_analyze)
 
-    # Generate base audio for comparison (reuse if already cached with same text)
-    if "base_audio" not in _state or _state.get("target_text") != target_text:
+    # Generate base audio for comparison
+    if "base_audio" not in _state or _state.get("target_text") != target_text or component_source_changed:
         progress(0.25, desc="Generating base voice audio...")
         base_audio_np = speech_gen.generate_audio(target_text, base_voice)
     else:
@@ -424,7 +448,7 @@ def run_analysis(base_voice_file, target_audio, target_text, target_text_file, v
             scale = float(all_singular_values[i]) * 0.1
 
             perturbed_flat = base_flat + component * scale
-            perturbed_voice = perturbed_flat.reshape(analyzer.voice_shape)
+            perturbed_voice = perturbed_flat.reshape(voice_shape)
 
             audio = speech_gen.generate_audio(target_text, perturbed_voice)
             features = fitness.extract_features(audio)
@@ -441,18 +465,15 @@ def run_analysis(base_voice_file, target_audio, target_text, target_text_file, v
     else:
         progress(0.93, desc="All components already analyzed, reusing...")
 
-    analyzer.sensitivity = existing_sensitivity
-
-    # Analyze components: names, impact scores, dominant sensitivity
+    # --- Phase 6: Name components and rank ---
     progress(0.95, desc="Computing impact scores...")
     comp_names, impacts, dominant_sens = analyze_components(
         existing_sensitivity, n_active, all_singular_values, component_ranges)
 
-    # Rank by impact for auto-tune ordering
     impact_order = sorted(range(n_active), key=lambda i: impacts.get(i, 0), reverse=True)
 
-    # Store everything in module-level state
-    _state["analyzer"] = analyzer
+    # --- Store state ---
+    _state["voice_shape"] = voice_shape
     _state["all_components"] = all_components
     _state["all_singular_values"] = all_singular_values
     _state["base_voice"] = base_voice
@@ -467,16 +488,17 @@ def run_analysis(base_voice_file, target_audio, target_text, target_text_file, v
     _state["impacts"] = impacts
     _state["dominant_sensitivity"] = dominant_sens
     _state["impact_order"] = impact_order
+    _state["per_component_variance"] = per_component_variance
 
     progress(1.0, desc="Done!")
 
     slider_updates = build_slider_updates(
-        n_active, comp_names, analyzer.per_component_variance, dominant_sens)
+        n_active, comp_names, per_component_variance, dominant_sens)
 
     new_count = total_to_analyze
     reused_count = n_active - total_to_analyze
 
-    # Build impact ranking summary
+    # Build status summary
     ranking_lines = []
     for rank, i in enumerate(impact_order[:10]):
         name = comp_names.get(i, f"comp_{i}")
@@ -484,14 +506,22 @@ def run_analysis(base_voice_file, target_audio, target_text, target_text_file, v
         ds = dominant_sens.get(i, 0)
         ranking_lines.append(f"  {rank+1}. {name} (impact={imp:.1f}, dominant \u0394={ds:.0%}/unit)")
 
-    pca_info = (
-        f"PCA: {n_active} active / {analyzer.n_components} total components (max possible: {len(voice_tensors)-1} from {len(voice_tensors)} voices), "
-        f"{analyzer.explained_variance_ratio:.1%} total variance. "
-        f"({new_count} newly analyzed, {reused_count} reused)\n\n"
+    source_parts = []
+    if use_pca and analyzer is not None:
+        source_parts.append(
+            f"PCA: {analyzer.n_components} components ({analyzer.explained_variance_ratio:.1%} variance)"
+        )
+    if use_discovery and discovery_cache_data is not None:
+        n_disc = discovery_cache_data.get("components", torch.zeros(0, 1)).shape[0]
+        source_parts.append(f"Discoveries: {n_disc} components")
+
+    status_info = (
+        f"Sources: {', '.join(source_parts)}\n"
+        f"Active: {n_active} components ({new_count} newly analyzed, {reused_count} reused)\n\n"
         f"Impact ranking (auto-tune order):\n" + "\n".join(ranking_lines)
     )
 
-    return (*slider_updates, pca_info,
+    return (*slider_updates, status_info,
             gr.update(interactive=True), gr.update(interactive=True), gr.update(interactive=True))
 
 
@@ -500,11 +530,11 @@ def generate_voice(*args):
     slider_values = args[:MAX_SLIDERS]
     target_text = args[MAX_SLIDERS]
 
-    if "analyzer" not in _state:
+    if "all_components" not in _state:
         raise gr.Error("Run analysis first!")
 
-    analyzer = _state["analyzer"]
-    all_components = _state.get("all_components", _state["analyzer"].components)
+    all_components = _state["all_components"]
+    voice_shape = _state["voice_shape"]
     n_active = _state["n_active"]
     base_voice = _state["base_voice"]
     speech_gen = _state["speech_gen"]
@@ -524,10 +554,10 @@ def generate_voice(*args):
     for i in range(n_active):
         coeffs[i] = float(slider_values[i])
 
-    # Apply PCA perturbation
+    # Apply perturbation along selected components
     scaled = coeffs * component_ranges
     perturbation_flat = (scaled.unsqueeze(0) @ all_components).squeeze(0)
-    designed_voice = base_voice + perturbation_flat.reshape(analyzer.voice_shape)
+    designed_voice = base_voice + perturbation_flat.reshape(voice_shape)
 
     audio = speech_gen.generate_audio(text, designed_voice)
     target_sim = fitness.target_similarity(audio)
@@ -555,11 +585,11 @@ def auto_tune(*args):
     start_step = float(args[MAX_SLIDERS + 2])
     mag_steps = int(args[MAX_SLIDERS + 3])
 
-    if "analyzer" not in _state:
+    if "all_components" not in _state:
         raise gr.Error("Run analysis first!")
 
-    analyzer = _state["analyzer"]
-    all_components = _state.get("all_components", _state["analyzer"].components)
+    all_components = _state["all_components"]
+    voice_shape = _state["voice_shape"]
     n_active = _state["n_active"]
     base_voice = _state["base_voice"]
     speech_gen = _state["speech_gen"]
@@ -575,7 +605,7 @@ def auto_tune(*args):
     def score(coeffs):
         scaled = coeffs * component_ranges
         p = (scaled.unsqueeze(0) @ all_components).squeeze(0)
-        voice = base_voice + p.reshape(analyzer.voice_shape)
+        voice = base_voice + p.reshape(voice_shape)
         audio = speech_gen.generate_audio(text, voice)
         return float(fitness.target_similarity(audio))
 
@@ -695,7 +725,7 @@ def auto_tune(*args):
     log.append(f"Done. Total evaluations: {eval_count}")
     scaled = coeffs * component_ranges
     p = (scaled.unsqueeze(0) @ all_components).squeeze(0)
-    designed_voice = base_voice + p.reshape(analyzer.voice_shape)
+    designed_voice = base_voice + p.reshape(voice_shape)
     audio = speech_gen.generate_audio(text, designed_voice)
 
     current_features = fitness.extract_features(audio)
@@ -754,11 +784,22 @@ def build_ui():
 
         # --- Analysis ---
         with gr.Accordion("Analysis", open=True):
+            # Component source selection
             with gr.Row():
-                n_components_input = gr.Number(
-                    label="Components", value=20, minimum=5, maximum=MAX_SLIDERS,
+                use_pca_checkbox = gr.Checkbox(label="Use PCA Components", value=True)
+                use_discovery_checkbox = gr.Checkbox(label="Use Discovered Components", value=True)
+            with gr.Row():
+                pca_components_input = gr.Number(
+                    label="PCA Components to Analyze",
+                    value=20, minimum=5, maximum=MAX_SLIDERS,
                     step=5, precision=0,
-                    info="PCA dimensions to use. Start with 20, increase to add subtler controls. Re-click Analyze to expand (incremental).",
+                    info="How many principal directions to extract from voice library.",
+                )
+                active_components_input = gr.Number(
+                    label="Active Components for Tuning",
+                    value=20, minimum=1, maximum=MAX_SLIDERS,
+                    step=1, precision=0,
+                    info="How many component sliders to show. Independent of PCA count.",
                 )
                 analyze_btn = gr.Button("Analyze", variant="primary")
             status_text = gr.Textbox(label="Status", interactive=False)
@@ -823,13 +864,6 @@ def build_ui():
         with gr.Row():
             generate_btn = gr.Button("Generate", variant="primary", interactive=False)
             reset_btn = gr.Button("Reset Sliders", interactive=False)
-
-        # --- Component Sources ---
-        gr.Markdown("### Component Sources")
-        with gr.Row():
-            use_pca_checkbox = gr.Checkbox(label="Use PCA Components", value=True)
-            use_discovery_checkbox = gr.Checkbox(label="Use Discovered Components", value=True)
-
         with gr.Row():
             auto_tune_btn = gr.Button("Auto-Tune", variant="secondary", interactive=False)
             passes_input = gr.Number(label="Passes", value=3, minimum=1, maximum=100, step=1, precision=0)
@@ -856,9 +890,18 @@ def build_ui():
             outputs=[discovery_status],
         )
 
+        # Toggle PCA components input visibility based on checkbox
+        use_pca_checkbox.change(
+            fn=lambda checked: gr.update(visible=checked),
+            inputs=[use_pca_checkbox],
+            outputs=[pca_components_input],
+        )
+
         analyze_btn.click(
             fn=run_analysis,
-            inputs=[base_voice_input, target_audio_input, target_text_input, target_text_file, voice_folder_input, n_components_input, use_pca_checkbox, use_discovery_checkbox],
+            inputs=[base_voice_input, target_audio_input, target_text_input, target_text_file,
+                    voice_folder_input, pca_components_input, active_components_input,
+                    use_pca_checkbox, use_discovery_checkbox],
             outputs=[*sliders, status_text, generate_btn, reset_btn, auto_tune_btn],
         )
 
