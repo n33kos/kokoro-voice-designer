@@ -15,3 +15,7 @@ _hf_cache/
 # Output files (designed voices, audio)
 output/*
 !output/.gitkeep
+
+# Input files (designed voices, audio)
+input/*
+!input/.gitkeep

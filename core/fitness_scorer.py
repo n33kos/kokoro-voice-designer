@@ -85,7 +85,8 @@ class FitnessScorer:
         audio_embed2 = self.encoder.embed_utterance(audio_wav2)
         return np.inner(audio_embed1, audio_embed2)
 
-    def extract_features(self, audio: NDArray[np.float32] | NDArray[np.float64], sr: int = 24000) -> dict[str, Any]:
+    @staticmethod
+    def extract_features(audio: NDArray[np.float32] | NDArray[np.float64], sr: int = 24000) -> dict[str, Any]:
         """
         Extract a comprehensive set of audio features for fingerprinting speech segments.
 

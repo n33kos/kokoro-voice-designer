@@ -1,6 +1,6 @@
 # Voice Designer
 
-Interactive voice crafting tool built on PCA decomposition of [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) voice tensors. Replaces the manual JSON-edit-and-rerun workflow with a Gradio web UI featuring real-time sliders, automated optimization, and live audio feedback.
+Interactive voice crafting tool built on [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M). Uses PCA decomposition of voice tensors plus orthogonal discovery probing to find and control the dimensions that shape how a voice sounds.
 
 ## Quick Start
 
@@ -9,56 +9,44 @@ uv sync
 uv run python app.py
 ```
 
-On first launch, all 54 Kokoro voice `.pt` files are downloaded from HuggingFace automatically.
+Voices are downloaded automatically on first launch. Open `http://localhost:7860`.
 
-Open the URL shown in the terminal (usually `http://localhost:7860`).
+## What It Does
 
-## How It Works
-
-Kokoro voice tensors live in a ~130K-dimensional space. Most of that is noise. PCA extracts the 20-40 principal directions that actually distinguish voices, and sensitivity analysis maps each direction to an audio feature (pitch, brightness, nasality, etc.).
-
-You then adjust named sliders to sculpt a voice targeting a reference audio sample, with similarity scoring as feedback.
+- **PCA Analysis**: Extracts the principal directions that distinguish Kokoro's 54 built-in voices, then maps each direction to an audio feature (pitch, brightness, nasality, etc.)
+- **Discovery Mode**: Probes random directions orthogonal to PCA to find impactful voice dimensions that don't exist in the sample voices — expands what's possible beyond the original voice library
+- **Manual Tuning**: Named sliders let you sculpt a voice targeting a reference audio sample, with real-time similarity scoring
+- **Auto-Tune**: Automated coordinate descent that optimizes slider positions to maximize similarity to your target voice
 
 ## Workflow
 
-### 1. Setup
-- **Base Voice**: Upload a `.pt` voice tensor as your starting point (any Kokoro voice from `voices/`)
-- **Target Audio**: Upload a `.wav` of the voice you want to match
-- **Target Text**: Enter text for Kokoro to generate (used for comparison)
-- **Components**: Number of PCA dimensions (start with 20, increase for finer control)
+1. **Setup** — Upload a base voice `.pt`, a target audio `.wav`, and enter the text for comparison
+2. **Analyze** — Runs PCA and sensitivity analysis (~2 min for 20 components). Results are cached incrementally
+3. **Discovery** (optional) — Probes orthogonal directions beyond PCA to find additional impactful dimensions. Takes ~10-20 min depending on probe count. Results accumulate across runs
+4. **Tune** — Adjust sliders manually or use Auto-Tune to optimize toward your target
+5. **Export** — Download the designed `.pt` voice file
 
-### 2. Analyze
-Click **Analyze** to run PCA decomposition and sensitivity analysis. This takes ~2 minutes for 20 components (one Kokoro inference per component). Results are cached — increasing components later only analyzes the new ones.
+## Discovery Mode
 
-### 3. Manual Tuning
-Each slider controls one PCA direction, labeled by its dominant audio effect (pitch, brightness, timbre, etc.) with variance percentage. Range is [-2, 2] where 1.0 = full observed voice range.
+Standard PCA only captures variance between the 54 sample voices. Discovery explores the full ~130K-dimensional voice space to find directions PCA misses:
 
-Click **Generate** to hear the result and see the target similarity score + feature gaps.
-
-### 4. Auto-Tune
-Automated coordinate descent that does the manual binary search process for you:
-
-- **Passes**: Number of full sweeps across all components
-- **Starting step**: Initial probe size (e.g., 0.1)
-- **Magnitude steps**: How many 10x reductions to try (e.g., 3 = tries 0.1, 0.01, 0.001)
-
-The UI updates live — sliders move to show what's being tested, and the similarity score updates on every evaluation.
-
-### 5. Export
-Download the designed `.pt` file from the Results section. Use it as `--starting_voice` in [kvoicewalk](https://github.com/RobertAgee/kvoicewalk) for further automated refinement.
+- Generates random directions orthogonal to all known components (PCA + prior discoveries)
+- Tests each direction by perturbing the voice and measuring audio feature changes
+- Keeps directions with significant impact, discards the rest
+- Cache accumulates across runs — each session finds new directions
 
 ## Project Structure
 
 ```
 voice-designer/
-├── app.py                  # Gradio UI + all orchestration
-├── pyproject.toml          # uv-managed dependencies
+├── app.py                  # Gradio UI + orchestration
 ├── core/
-│   ├── voice_analyzer.py   # PCA decomposition + sensitivity analysis
+│   ├── voice_analyzer.py   # PCA decomposition + sensitivity
 │   ├── speech_generator.py # Kokoro TTS wrapper
-│   └── fitness_scorer.py   # Audio feature extraction + similarity scoring
-├── voices/                 # Kokoro .pt files (auto-downloaded, gitignored)
-└── output/                 # Designed voices + audio (gitignored)
+│   ├── fitness_scorer.py   # Audio feature extraction + similarity
+│   └── discovery.py        # Orthogonal probing beyond PCA
+├── voices/                 # Kokoro .pt files (auto-downloaded)
+└── output/                 # Designed voices + discovery cache
 ```
 
 ## Requirements
@@ -69,7 +57,7 @@ voice-designer/
 
 ## Tips
 
-- Start with a base voice that's already somewhat close to your target — the closer the starting point, the faster Auto-Tune converges
-- Use 20 components for coarse shaping, then expand to 30-40 for fine detail
-- When Auto-Tune plateaus, reduce the starting step size (e.g., 0.01) and increase magnitude steps
-- The designed `.pt` works as a starting point for kvoicewalk's random walk, combining manual design with automated exploration
+- Start with a base voice close to your target for faster convergence
+- Use 20 components for coarse shaping, expand higher values for fine detail
+- Run Discovery once to build a cache, then re-run with more probes to expand coverage. This file grows over time and captures the most impactful directions in voice space through cumulative discovery.
+- When Auto-Tune plateaus, try reducing step size or increasing magnitude steps
