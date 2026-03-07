@@ -104,6 +104,11 @@ class FitnessScorer:
         # Initialize features dictionary
         features = {}
 
+        # Ensure audio is long enough for spectral analysis
+        min_samples = 2048
+        if len(audio) < min_samples:
+            audio = np.pad(audio, (0, min_samples - len(audio)), mode='constant')
+
         # Basic features
         # features["duration"] = len(audio) / sr
         features["rms_energy"] = float(np.sqrt(np.mean(audio**2)))

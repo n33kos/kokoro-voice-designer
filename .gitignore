@@ -19,3 +19,7 @@ output/*
 # Input files (designed voices, audio)
 input/*
 !input/.gitkeep
+
+# Web frontend build artifacts
+web/node_modules/
+web/dist/

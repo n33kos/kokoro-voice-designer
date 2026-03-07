@@ -16,4 +16,7 @@ dependencies = [
     "soundfile>=0.13.1",
     "torch>=2.7.0",
     "tqdm>=4.67.1",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "python-multipart>=0.0.22",
 ]

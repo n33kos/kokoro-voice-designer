@@ -1,0 +1,163 @@
+.app {
+  min-height: 100vh;
+  background: #0e1117;
+  color: #e2e8f0;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+/* Reset */
+:global(*) {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+:global(body) {
+  background: #0e1117;
+  overflow-x: hidden;
+}
+
+.header {
+  text-align: center;
+  padding: 40px 20px 20px;
+}
+
+.title {
+  font-size: 28px;
+  font-weight: 600;
+  color: #f7fafc;
+  letter-spacing: -0.02em;
+}
+
+.subtitle {
+  margin-top: 6px;
+  font-size: 14px;
+  color: rgba(255, 255, 255, 0.35);
+}
+
+.main {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 48px;
+  width: 100%;
+  max-width: 1100px;
+  padding: 20px 40px 60px;
+}
+
+.chartPanel {
+  flex: 1;
+  min-width: 0;
+}
+
+.controlsPanel {
+  width: 280px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  padding-top: 16px;
+}
+
+/* Dimension slider control */
+.dimensionControl {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+  padding: 0 8px;
+}
+
+.dimensionLabel {
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.5);
+  white-space: nowrap;
+  min-width: 110px;
+}
+
+.dimensionSlider {
+  flex: 1;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+
+.dimensionSlider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #63b3ed;
+  cursor: pointer;
+  border: 2px solid #0e1117;
+}
+
+.dimensionSlider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #63b3ed;
+  cursor: pointer;
+  border: 2px solid #0e1117;
+}
+
+/* Loading / error states */
+.loading,
+.error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 60vh;
+  gap: 16px;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.error h2 {
+  color: #fc8181;
+  font-size: 20px;
+}
+
+.error p {
+  max-width: 400px;
+  text-align: center;
+  line-height: 1.5;
+}
+
+.loadingSpinner {
+  width: 32px;
+  height: 32px;
+  border: 3px solid rgba(99, 179, 237, 0.2);
+  border-top-color: #63b3ed;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Responsive */
+@media (max-width: 800px) {
+  .main {
+    flex-direction: column;
+    align-items: center;
+    gap: 24px;
+    padding: 20px 20px 40px;
+  }
+
+  .controlsPanel {
+    width: 100%;
+    max-width: 400px;
+  }
+}

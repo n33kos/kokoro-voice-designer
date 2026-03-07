@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Voice Designer — interactive PCA-based voice crafting with Gradio UI."""
 
+import warnings
+warnings.filterwarnings("ignore", message=".*output with one or more elements was resized.*")
+
 import os
 import tempfile
 import time
@@ -757,7 +760,7 @@ def reset_sliders():
 # ---------------------------------------------------------------------------
 
 def build_ui():
-    with gr.Blocks(title="Voice Designer", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title="Voice Designer") as demo:
         gr.Markdown("# Voice Designer\nCraft voices by exploring Kokoro's voice parameter space.")
 
         # --- Setup ---
@@ -930,4 +933,4 @@ if __name__ == "__main__":
     ensure_voices()
     OUTPUT_DIR.mkdir(exist_ok=True)
     demo = build_ui()
-    demo.launch()
+    demo.launch(theme=gr.themes.Soft())
