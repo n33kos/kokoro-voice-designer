@@ -537,6 +537,16 @@ def main() -> None:
     except KeyboardInterrupt:
         log(f"\nStopped after {iteration} iteration(s).")
         log(f"Best result saved to: {output_dir}/designed_voice.pt")
+
+        # Synthesize a WAV preview from the best voice
+        try:
+            audio = speech_gen.generate_audio(args.target_text, current_voice)
+            wav_path = output_dir / "designed_voice.wav"
+            sf.write(str(wav_path), audio, 24000)
+            log(f"WAV saved to: {wav_path}")
+        except Exception as e:
+            log(f"Warning: could not synthesize WAV ({e})")
+
         sys.exit(0)
 
 

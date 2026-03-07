@@ -113,7 +113,7 @@ def build_catalog(
     else:
         print("\nNo discovery cache found — catalog will contain PCA only.")
         if n_discoveries > 0:
-            print("  Run discovery first with auto_mode.py or the Gradio UI.")
+            print("  Run discovery first with auto_mode.py.")
 
     # --- Size estimate ---
     pca_size = analyzer.components.numel() * 4

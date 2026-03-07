@@ -18,7 +18,7 @@ Usage:
     python prune_cache.py --cache output/my_cache.pt --keep 500
 
 The pruned file is a valid discovery cache that can be loaded by the
-auto_mode.py and Gradio UI. Future discovery runs will continue to
+auto_mode.py. Future discovery runs will continue to
 accumulate into it.
 """
 

@@ -2,47 +2,39 @@
 
 Interactive voice crafting tool built on [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M). Uses PCA decomposition of voice tensors plus orthogonal discovery probing to find and control the dimensions that shape how a voice sounds.
 
-## Full Workflow
+## Getting Started
 
-The recommended end-to-end workflow, from raw voices to interactive tuning:
+The catalog and component labels are version-controlled, so you can clone and run immediately:
 
 ```bash
-# 1. Install dependencies
+# Install dependencies
 uv sync
 cd web && npm install && cd ..
 
-# 2. Build the discovery catalog (PCA + discovered directions)
-uv run python build_catalog.py
-
-# 3. Label components via sensitivity analysis (one Kokoro synthesis per component)
-uv run python label_components.py
-
-# 4. Start the web UI
-uv run uvicorn server:app --port 8000    # Terminal 1
-cd web && npm run dev                     # Terminal 2
-```
-
-Open `http://localhost:5173`.
-
-Steps 2 and 3 only need to be run once (or re-run when the catalog changes). The labels are saved to `catalog/component_labels.json` and loaded automatically by the server.
-
-## Web UI (Recommended)
-
-An interactive spider/radar chart interface for sculpting voices in real time with continuous audio playback and crossfade.
-
-### Quick Start
-
-```bash
-uv sync
-
 # Terminal 1 — start the backend API
-uv run uvicorn server:app --port 8000
+uv run uvicorn server:app --reload --port 8000
 
 # Terminal 2 — start the frontend dev server
-cd web && npm install && npm run dev
+cd web && npm run dev
 ```
 
 Open `http://localhost:5173`.
+
+## How It Works
+
+Kokoro-82M represents each voice as a **[510, 1, 256] tensor** — 130,560 dimensions. This tool finds and controls the directions in that space that actually matter.
+
+- **PCA** on Kokoro's 54 built-in voices identifies the axes of greatest variation — the most obvious differences between voices (pitch, timbre, resonance, etc.). This gives ~53 meaningful directions, but only within the span of the existing voice library.
+- **Discovery** probes random directions orthogonal to PCA and measures their effect on audio features. This finds impactful dimensions the voice library doesn't vary along — subtler characteristics like breathiness or texture that no pair of built-in voices differs on.
+- **Catalog** bundles the top PCA components and highest-impact discoveries into a single reusable file, so downstream tools skip recomputation.
+- **Auto mode** runs coordinate descent optimization over these dimensions, iteratively tuning a voice to maximize Resemblyzer embedding similarity against a target audio sample.
+- **Web UI** exposes the catalog dimensions as an interactive spider chart for manual voice sculpting with real-time audio preview.
+
+**A note on labels:** Component labels like "pitch" and "brightness" are approximations. Each dimension doesn't control a single isolated audio attribute — voice characteristics are entangled across the high-dimensional space. The labeling script measures which audio feature changes most when a component is perturbed, but in practice each component subtly affects multiple features simultaneously. Think of the labels as the _dominant_ effect, not the only one.
+
+## Web UI
+
+An interactive spider/radar chart interface for sculpting voices in real time with continuous audio playback and crossfade.
 
 ### How to Use
 
@@ -66,22 +58,13 @@ Click the **+** button next to the voice selector dropdown to upload a custom `.
 
 ### API Endpoints
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/health` | GET | Health check |
-| `/api/voices` | GET | List available .pt voice files |
-| `/api/catalog` | GET | Component names and count |
-| `/api/synthesize` | POST | Synthesize WAV from voice + coefficients + text |
-| `/api/upload-voice` | POST | Upload a .pt voice file to voices/ |
-
-## Gradio UI (Legacy)
-
-```bash
-uv sync
-uv run python app.py
-```
-
-Open `http://localhost:7860`.
+| Endpoint            | Method | Description                                     |
+| ------------------- | ------ | ----------------------------------------------- |
+| `/api/health`       | GET    | Health check                                    |
+| `/api/voices`       | GET    | List available .pt voice files                  |
+| `/api/catalog`      | GET    | Component names and count                       |
+| `/api/synthesize`   | POST   | Synthesize WAV from voice + coefficients + text |
+| `/api/upload-voice` | POST   | Upload a .pt voice file to voices/              |
 
 ## What It Does
 
@@ -133,6 +116,7 @@ uv run python auto_mode.py \
 If `catalog/discovery_catalog.pt` exists it is loaded automatically — no `--catalog` flag needed.
 
 Each iteration:
+
 1. Runs `--n-probes` discovery probes (accumulates into `output/discovery_cache.pt`)
 2. Loads PCA from catalog (or computes fresh) + top `--n-discovery` discovery components
 3. Runs sensitivity analysis on all active components
@@ -144,27 +128,38 @@ Stop at any time with **Ctrl+C**. The best result is always in `output/designed_
 
 **Key options:**
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--catalog` | auto-detected | Path to discovery catalog (skips PCA recomputation) |
-| `--n-probes` | 200 | Discovery probes per iteration |
-| `--n-pca` | 32 | PCA components to include |
-| `--n-discovery` | 32 | Top discovered components to include |
-| `--passes` | 3 | Auto-tune coordinate descent passes |
-| `--start-step` | 0.1 | Starting step size (scaled per-component by sensitivity) |
-| `--mag-steps` | 3 | Magnitude refinement steps (each is 10× smaller) |
-| `--keep-base` | off | Always start from original base voice instead of rolling forward |
+| Flag            | Default       | Description                                                      |
+| --------------- | ------------- | ---------------------------------------------------------------- |
+| `--catalog`     | auto-detected | Path to discovery catalog (skips PCA recomputation)              |
+| `--n-probes`    | 200           | Discovery probes per iteration                                   |
+| `--n-pca`       | 32            | PCA components to include                                        |
+| `--n-discovery` | 32            | Top discovered components to include                             |
+| `--passes`      | 3             | Auto-tune coordinate descent passes                              |
+| `--start-step`  | 0.1           | Starting step size (scaled per-component by sensitivity)         |
+| `--mag-steps`   | 3             | Magnitude refinement steps (each is 10× smaller)                 |
+| `--keep-base`   | off           | Always start from original base voice instead of rolling forward |
 
-## Discovery Catalog
+## Development: Improving Voice Dimensions
 
-The `catalog/` directory holds a version-controlled distillation of the best discovered voice directions, combined with pre-computed PCA. Using a catalog:
-- Eliminates repeated PCA computation across iterations
-- Packages the highest-value directions for sharing and reuse
-- Lets anyone clone the repo and skip straight to tuning without running discovery
+The catalog (`catalog/discovery_catalog.pt`) and labels (`catalog/component_labels.json`) are committed to the repo, so regular users don't need to rebuild them. The steps below are for actively improving the voice model by discovering new directions and updating the shipped catalog.
 
-### Building the catalog
+### 1. Discover new voice directions
 
-After accumulating discoveries in `output/discovery_cache.pt`:
+Run `auto_mode.py` to probe for impactful directions beyond PCA (see [Auto Mode](#auto-mode) above for full options):
+
+```bash
+uv run python auto_mode.py \
+    --base-voice voices/af_heart.pt \
+    --target-audio my_target.wav \
+    --target-text "Hello, my name is Alex." \
+    --n-probes 200
+```
+
+Discoveries accumulate in `output/discovery_cache.pt` across runs.
+
+### 2. Build the catalog
+
+Distill PCA + top discoveries into a single catalog file:
 
 ```bash
 # Build catalog with top 1000 discovered directions
@@ -177,11 +172,9 @@ uv run python build_catalog.py --dry-run
 uv run python build_catalog.py --n-discoveries 500 --output catalog/v2.pt
 ```
 
-Commit `catalog/discovery_catalog.pt` to version control. Use git-lfs for large catalogs.
+### 3. Label components
 
-### Labeling components
-
-After building a catalog, run sensitivity analysis to assign human-readable labels (pitch, brightness, nasality, etc.) to each component:
+Run sensitivity analysis to assign human-readable labels (pitch, brightness, nasality, etc.) to each component:
 
 ```bash
 # Label all components in the default catalog
@@ -194,7 +187,16 @@ uv run python label_components.py --voice voices/af_heart.pt --text "Hello there
 uv run python label_components.py --output catalog/my_labels.json
 ```
 
-This generates one Kokoro synthesis per component, so it takes a few minutes for large catalogs. Results are saved to `catalog/component_labels.json` as a simple JSON list. The web UI server loads these labels automatically on startup, replacing the default fallback names.
+This generates one Kokoro synthesis per component, so it takes a few minutes for large catalogs. Results are saved to `catalog/component_labels.json`. The web UI loads these labels automatically on startup.
+
+### 4. Commit the updated files
+
+```bash
+git add catalog/discovery_catalog.pt catalog/component_labels.json
+git commit -m "Update catalog and labels"
+```
+
+Use git-lfs for large catalogs.
 
 ### Pruning the working cache
 
@@ -242,7 +244,6 @@ voice-designer/
 │   │   └── types.ts
 │   ├── package.json
 │   └── vite.config.ts
-├── app.py                  # Gradio UI + orchestration (legacy)
 ├── auto_mode.py            # Headless continuous refinement loop
 ├── synthesize.py           # Quick test synthesis from any .pt voice
 ├── build_catalog.py        # Distill PCA + top discoveries into a catalog
