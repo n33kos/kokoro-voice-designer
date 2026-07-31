@@ -26,6 +26,7 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 import time
 import warnings
@@ -48,6 +49,11 @@ from core.perceptual_loss import (
     WavLMPooledLoss,
     pacing_loss,
     speaking_rate,
+)
+from core.speaker_loss import (
+    SpeakerEmbeddingLoss,
+    build_manifold_bounds,
+    manifold_penalty,
 )
 
 PROJECT_ROOT = Path(__file__).parent
@@ -92,6 +98,8 @@ class StyleParameterization(torch.nn.Module):
 
     def __init__(self, base_voice: torch.Tensor, n_basis: int = 6, device: str = "cpu"):
         super().__init__()
+        if n_basis < 1:
+            raise ValueError("n_basis must be at least 1")
         self.device = device
         self.n_rows = base_voice.shape[0]
         self.base = base_voice.reshape(self.n_rows, 256).float().to(device)
@@ -144,6 +152,10 @@ def invert(
     reg_weight: float,
     device: str,
     train_texts: list[str] | None = None,
+    speaker: SpeakerEmbeddingLoss | None = None,
+    target_embed: torch.Tensor | None = None,
+    speaker_weight: float = 0.0,
+    bounds: tuple[torch.Tensor, torch.Tensor] | None = None,
     ground_truth: torch.Tensor | None = None,
     checkpoint_path: Path | None = None,
     checkpoint_every: int = 5,
@@ -192,7 +204,7 @@ def invert(
         # the shared objective. Accumulating over all texts makes each step a
         # genuine descent direction.
         opt.zero_grad()
-        totals = {"perceptual": 0.0, "pacing": 0.0}
+        totals = {"perceptual": 0.0, "pacing": 0.0, "speaker": 0.0}
         total_loss = 0.0
 
         for text, ps, ctx in contexts:
@@ -221,15 +233,25 @@ def invert(
                 loss = loss + pacing_weight * lp
                 totals["pacing"] += float(lp)
 
+            # Speaker-embedding term. WavLM statistics and Resemblyzer optimize
+            # different things — texture versus identity — and each alone admits
+            # solutions the other rejects.
+            if speaker is not None and target_embed is not None and speaker_weight > 0:
+                ls = speaker(out.audio.unsqueeze(0), target_embed)
+                loss = loss + speaker_weight * ls
+                totals["speaker"] += float(ls)
+
             (loss / len(contexts)).backward()
             total_loss += float(loss) / len(contexts)
 
-        if reg_weight > 0:
-            # Keep the style vector near the built-in voice manifold; gradient
-            # descent will happily walk into regions Kokoro never saw.
-            reg = params.timbre_delta.pow(2).mean() + params.prosody_coeffs.pow(2).mean()
+        if reg_weight > 0 and bounds is not None:
+            # Hinge penalty on leaving the per-dimension range spanned by the
+            # built-in voices. Zero inside the box, so it costs nothing until the
+            # optimizer actually walks into territory Kokoro never saw — which is
+            # where the croakiness and end-of-word pitch jumps come from.
+            reg = manifold_penalty(params.voice(), bounds[0], bounds[1])
             (reg_weight * reg).backward()
-            totals["reg"] = float(reg)
+            totals["reg"] = float(reg) * len(contexts)
 
         torch.nn.utils.clip_grad_norm_(params.parameters(), 1.0)
         opt.step()
@@ -242,10 +264,15 @@ def invert(
         if step % 5 == 0 or step == steps - 1:
             tm, pm = params.magnitude()
             extra = ""
+            if bounds is not None:
+                out_of_box = float(
+                    ((params.voice() < bounds[0]) | (params.voice() > bounds[1])).float().mean()
+                )
+                extra = f" outside_manifold={100*out_of_box:.1f}%"
             if ground_truth is not None:
                 err = float((params.voice() - ground_truth).abs().mean())
                 base_err = float((params.base - ground_truth).abs().mean())
-                extra = f" recov_err={err:.5f} (start {base_err:.5f})"
+                extra += f" recov_err={err:.5f} (start {base_err:.5f})"
             msg = "  ".join(f"{k}={v:.5f}" for k, v in parts.items())
             log(f"  step {step:4d}/{steps}  loss={total_loss:.5f}  {msg}  "
                 f"|timbre|={tm:.4f} |prosody|={pm:.4f}{extra}")
@@ -268,7 +295,16 @@ def main() -> int:
     ap.add_argument("--lr", type=float, default=0.02)
     ap.add_argument("--n-basis", type=int, default=6, help="Prosody basis functions")
     ap.add_argument("--pacing-weight", type=float, default=0.1)
-    ap.add_argument("--reg-weight", type=float, default=0.0)
+    ap.add_argument("--speaker-weight", type=float, default=0.0,
+                    help="Weight on the differentiable Resemblyzer speaker loss. "
+                         "Complements the WavLM term, which optimizes texture "
+                         "rather than identity. Note this makes Resemblyzer a "
+                         "training target, so evaluate with something else too.")
+    ap.add_argument("--reg-margin", type=float, default=0.1,
+                    help="Slack outside the built-in voice range, as a fraction of each dimension's span")
+    ap.add_argument("--reg-weight", type=float, default=0.0,
+                    help="Weight on the manifold hinge penalty — keeps style dims "
+                         "inside the range spanned by the built-in voices")
     ap.add_argument("--device", default="cpu",
                     help="cpu is usually right — 82M params, and MPS backward has gaps")
     ap.add_argument("--out", default=str(OUTPUT_DIR / "inverted_voice.pt"))
@@ -292,7 +328,6 @@ def main() -> int:
     perceptual = WavLMPooledLoss(device=args.device)
 
     base_voice = load_voice(args.base)
-    params = StyleParameterization(base_voice, n_basis=args.n_basis, device=args.device)
 
     # --- Build target statistics ---
     ground_truth = None
@@ -346,6 +381,21 @@ def main() -> int:
             log("  no --target-text: falling back to pooled stats over generic "
                 "texts. Expect a worse result — supply a transcript if you can.")
 
+    # The prosody profile is a cosine basis over the 510 rows, but only the rows
+    # matching a training text's phoneme count are ever constrained. With more
+    # basis functions than anchored lengths the rest is free to ring: a single
+    # 229-phoneme transcript produced offsets of 0.86 at row 300 against a base
+    # prosody magnitude of 0.13, which is what makes untrained lengths sound
+    # broken. Cap the basis at the number of distinct anchored lengths — with one
+    # training text that means a single constant offset, which is all the data
+    # can actually support.
+    n_anchors = len({len(diff.phonemize(gen.pipeline, t)) for t in train_texts})
+    n_basis = min(args.n_basis, n_anchors)
+    if n_basis < args.n_basis:
+        log(f"Limiting prosody basis to {n_basis} ({n_anchors} distinct training "
+            f"length(s); {args.n_basis} requested would be underdetermined)")
+    params = StyleParameterization(base_voice, n_basis=n_basis, device=args.device)
+
     log("Computing target statistics...")
     if args.sanity_check or args.target_text:
         # Matched content: one target per training text, so the loss floor is
@@ -358,6 +408,23 @@ def main() -> int:
         stats = [perceptual.target_stats(a.unsqueeze(0)) for a in target_audio]
         target_stats = torch.cat(stats, dim=0).mean(dim=0, keepdim=True)
 
+    speaker = None
+    target_embed = None
+    if args.speaker_weight > 0:
+        log("Loading Resemblyzer for the speaker loss...")
+        speaker = SpeakerEmbeddingLoss(device=args.device)
+        embeds = [speaker.target_embedding(a.unsqueeze(0)) for a in target_audio]
+        target_embed = torch.cat(embeds, dim=0).mean(dim=0, keepdim=True)
+        target_embed = target_embed / target_embed.norm(dim=1, keepdim=True)
+
+    bounds = None
+    if args.reg_weight > 0:
+        lib = [load_voice(VOICES_DIR / f) for f in sorted(os.listdir(VOICES_DIR))
+               if f.endswith(".pt")]
+        bounds = build_manifold_bounds(lib, margin=args.reg_margin)
+        bounds = (bounds[0].to(args.device), bounds[1].to(args.device))
+        log(f"Manifold bounds from {len(lib)} voices, margin {args.reg_margin}")
+
     log(f"Optimizing {sum(p.numel() for p in params.parameters())} parameters "
         f"({args.steps} steps, lr={args.lr}, device={args.device})...")
     t0 = time.time()
@@ -368,6 +435,10 @@ def main() -> int:
         diff, gen.pipeline, params, perceptual, target_stats, target_rates,
         args.steps, args.lr, args.pacing_weight, args.reg_weight, args.device,
         train_texts=train_texts,
+        speaker=speaker,
+        target_embed=target_embed,
+        speaker_weight=args.speaker_weight,
+        bounds=bounds,
         ground_truth=ground_truth,
         checkpoint_path=ckpt,
         checkpoint_every=args.checkpoint_every,
