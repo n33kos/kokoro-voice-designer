@@ -42,6 +42,10 @@ class TextContext:
     d_en: torch.Tensor
     t_en: torch.Tensor
     phonemes: str
+    # True at token positions that carry actual speech sound. Stress marks,
+    # spaces, punctuation and the BOS/EOS tokens legitimately get ~1 frame, so
+    # any duration constraint has to exclude them.
+    phoneme_mask: torch.Tensor
 
 
 @dataclass
@@ -94,6 +98,14 @@ class DifferentiableKokoro:
         d_en = self.model.bert_encoder(bert_dur).transpose(-1, -2)
         t_en = self.model.text_encoder(input_ids, input_lengths, text_mask)
 
+        # Token layout is [BOS, *phonemes, EOS], so index i+1 corresponds to
+        # phonemes[i].
+        non_speech = set(" ˈˌ,.;:!?…\"'()-")
+        mask = torch.zeros(input_ids.shape[1], dtype=torch.bool, device=self.device)
+        for i, ch in enumerate(phonemes):
+            if i + 1 < mask.shape[0] and ch not in non_speech:
+                mask[i + 1] = True
+
         return TextContext(
             input_ids=input_ids,
             input_lengths=input_lengths,
@@ -101,6 +113,7 @@ class DifferentiableKokoro:
             d_en=d_en,
             t_en=t_en,
             phonemes=phonemes,
+            phoneme_mask=mask,
         )
 
     # -- style side ----------------------------------------------------------

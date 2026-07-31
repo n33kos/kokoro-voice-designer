@@ -46,7 +46,11 @@ from core.differentiable_kokoro import DifferentiableKokoro
 from core.perceptual_loss import (
     FRAME_HOP,
     KOKORO_SR,
+    SpectralBalanceLoss,
     WavLMPooledLoss,
+    duration_floor_loss,
+    f0_reference_stats,
+    f0_stats_loss,
     pacing_loss,
     speaking_rate,
 )
@@ -155,6 +159,13 @@ def invert(
     speaker: SpeakerEmbeddingLoss | None = None,
     target_embed: torch.Tensor | None = None,
     speaker_weight: float = 0.0,
+    spectral: SpectralBalanceLoss | None = None,
+    target_ltas: torch.Tensor | None = None,
+    spectral_weight: float = 0.0,
+    f0_target: tuple[float, float] | None = None,
+    f0_weight: float = 0.0,
+    duration_weight: float = 0.0,
+    duration_min_frames: float = 2.0,
     bounds: tuple[torch.Tensor, torch.Tensor] | None = None,
     ground_truth: torch.Tensor | None = None,
     checkpoint_path: Path | None = None,
@@ -204,7 +215,7 @@ def invert(
         # the shared objective. Accumulating over all texts makes each step a
         # genuine descent direction.
         opt.zero_grad()
-        totals = {"perceptual": 0.0, "pacing": 0.0, "speaker": 0.0}
+        totals = {"perceptual": 0.0, "pacing": 0.0, "speaker": 0.0, "spectral": 0.0, "f0": 0.0, "dur": 0.0}
         total_loss = 0.0
 
         for text, ps, ctx in contexts:
@@ -240,6 +251,27 @@ def invert(
                 ls = speaker(out.audio.unsqueeze(0), target_embed)
                 loss = loss + speaker_weight * ls
                 totals["speaker"] += float(ls)
+
+            # Long-term spectral balance. The other terms left a measurable
+            # high-frequency excess that reads as graininess.
+            if spectral is not None and target_ltas is not None and spectral_weight > 0:
+                lsp = spectral(out.audio.unsqueeze(0), target_ltas)
+                loss = loss + spectral_weight * lsp
+                totals["spectral"] += float(lsp)
+
+            # Pitch distribution. Generated voices ran ~2x the reference's rate
+            # of large pitch excursions, heard as spiking at word ends.
+            if f0_target is not None and f0_weight > 0:
+                lf = f0_stats_loss(out.f0_pred, f0_target[0], f0_target[1])
+                loss = loss + f0_weight * lf
+                totals["f0"] += float(lf)
+
+            # Lengthen phonemes Kokoro swallows, without slowing everything.
+            if duration_weight > 0:
+                ld = duration_floor_loss(out.duration, ctx.phoneme_mask,
+                                         duration_min_frames)
+                loss = loss + duration_weight * ld
+                totals["dur"] += float(ld)
 
             (loss / len(contexts)).backward()
             total_loss += float(loss) / len(contexts)
@@ -287,7 +319,11 @@ def main() -> int:
     ap.add_argument("--target", help="Reference audio (.wav). Repeatable.", action="append")
     ap.add_argument("--sanity-check", help="Built-in voice filename to recover (proof test)")
     ap.add_argument("--base", default=str(VOICES_DIR / "af_heart.pt"), help="Starting voice")
-    ap.add_argument("--target-text", help="Transcript of --target audio; enables the pacing loss")
+    ap.add_argument("--target-text", action="append",
+                    help="Transcript for the corresponding --target, as a file path "
+                         "or literal text. Repeat once per clip, in the same order. "
+                         "Supplying these is strongly recommended: it makes the "
+                         "content match and enables the pacing loss.")
     ap.add_argument("--steps", type=int, default=300)
     # The paper's 2e-4 is tuned for its own parameterization. Ours starts at a
     # zero offset and needs to travel ~0.08 mean-abs to reach a different voice,
@@ -300,6 +336,17 @@ def main() -> int:
                          "Complements the WavLM term, which optimizes texture "
                          "rather than identity. Note this makes Resemblyzer a "
                          "training target, so evaluate with something else too.")
+    ap.add_argument("--spectral-weight", type=float, default=0.0,
+                    help="Weight on long-term spectral balance matching; targets "
+                         "the high-frequency excess that reads as graininess")
+    ap.add_argument("--f0-weight", type=float, default=0.0,
+                    help="Weight on matching the reference's log-F0 mean and spread; "
+                         "targets excess pitch excursions at word ends")
+    ap.add_argument("--duration-weight", type=float, default=0.0,
+                    help="Weight on lengthening under-allocated phonemes; targets "
+                         "words that sound swallowed or rushed")
+    ap.add_argument("--duration-min-frames", type=float, default=2.0,
+                    help="Frames a speech phoneme should get at minimum (1 frame = 25ms)")
     ap.add_argument("--reg-margin", type=float, default=0.1,
                     help="Slack outside the built-in voice range, as a fraction of each dimension's span")
     ap.add_argument("--reg-weight", type=float, default=0.0,
@@ -352,31 +399,53 @@ def main() -> int:
     else:
         target_audio = []
         target_rates = {}
+        clips = []
         for path in args.target:
             audio, _ = librosa.load(path, sr=KOKORO_SR, mono=True)
-            target_audio.append(torch.from_numpy(audio).float().to(args.device))
+            clips.append(torch.from_numpy(audio).float().to(args.device))
             log(f"  target: {Path(path).name}  {len(audio)/KOKORO_SR:.1f}s")
 
         if args.target_text:
-            # Train on the reference clip's own transcript. Pooled WavLM stats
-            # are strongly content-dependent, so matching content collapses the
-            # loss floor from ~0.098 to 0 — the difference between the optimizer
-            # having a reachable target and distorting the voice chasing an
-            # average no single utterance can produce.
-            transcript = Path(args.target_text).read_text().strip() \
-                if Path(args.target_text).exists() else args.target_text
-            train_texts = [transcript]
-            ps = diff.phonemize(gen.pipeline, transcript)
-            rate = speaking_rate(len(ps), len(target_audio[0]))
-            target_rates = {transcript: rate}
-            log(f"  transcript: {len(ps)} phonemes, "
-                f"measured rate {rate:.2f} phonemes/sec")
-            if len(ps) > 510:
-                log(f"  WARNING: transcript exceeds Kokoro's 510-phoneme limit "
-                    f"and will be truncated; use a shorter clip")
+            # Each clip is paired with its own transcript, by position. Pooled
+            # WavLM stats are strongly content-dependent, so matching content
+            # per clip collapses the loss floor from ~0.098 to 0 — the
+            # difference between the optimizer having a reachable target and
+            # distorting the voice chasing an average no single utterance can
+            # produce.
+            if len(args.target_text) != len(args.target):
+                ap.error(
+                    f"got {len(args.target)} --target but "
+                    f"{len(args.target_text)} --target-text; each clip needs "
+                    f"its own transcript, paired in order"
+                )
+
+            train_texts, target_audio = [], []
+            for path, spec, clip in zip(args.target, args.target_text, clips):
+                transcript = (Path(spec).read_text().strip()
+                              if Path(spec).exists() else spec)
+                ps = diff.phonemize(gen.pipeline, transcript)
+                if len(ps) > 510:
+                    log(f"  WARNING: {Path(path).name} transcript is {len(ps)} "
+                        f"phonemes, over Kokoro's 510 limit; it will be "
+                        f"truncated. Use a shorter clip.")
+                if transcript in target_rates:
+                    # Identical text means identical row and identical target;
+                    # keeping both just doubles the cost of that one anchor.
+                    log(f"  skipping {Path(path).name}: duplicate transcript")
+                    continue
+                train_texts.append(transcript)
+                target_audio.append(clip)
+                target_rates[transcript] = speaking_rate(len(ps), len(clip))
+                log(f"  {Path(path).name}: {len(ps)} phonemes, "
+                    f"{target_rates[transcript]:.1f} phonemes/sec")
+
+            lengths = sorted({len(diff.phonemize(gen.pipeline, t)) for t in train_texts})
+            log(f"  {len(train_texts)} clips, {len(lengths)} distinct lengths "
+                f"({lengths[0]}-{lengths[-1]} phonemes)")
         else:
             # No transcript means no matched content and no phoneme count, so
             # neither the low loss floor nor the pacing term is available.
+            target_audio = clips
             train_texts = list(TRAIN_TEXTS)
             log("  no --target-text: falling back to pooled stats over generic "
                 "texts. Expect a worse result — supply a transcript if you can.")
@@ -417,6 +486,21 @@ def main() -> int:
         target_embed = torch.cat(embeds, dim=0).mean(dim=0, keepdim=True)
         target_embed = target_embed / target_embed.norm(dim=1, keepdim=True)
 
+    spectral = None
+    target_ltas = None
+    if args.spectral_weight > 0:
+        spectral = SpectralBalanceLoss(device=args.device)
+        ltas = [spectral.target_ltas(a.unsqueeze(0)) for a in target_audio]
+        target_ltas = torch.cat(ltas, dim=0).mean(dim=0, keepdim=True)
+        log("Spectral balance target computed from reference audio")
+
+    f0_target = None
+    if args.f0_weight > 0:
+        ref = target_audio[0].detach().cpu().numpy()
+        f0_target = f0_reference_stats(ref)
+        log(f"F0 target from reference: log-mean={f0_target[0]:.3f} "
+            f"({np.exp(f0_target[0]):.1f} Hz), log-std={f0_target[1]:.3f}")
+
     bounds = None
     if args.reg_weight > 0:
         lib = [load_voice(VOICES_DIR / f) for f in sorted(os.listdir(VOICES_DIR))
@@ -438,6 +522,13 @@ def main() -> int:
         speaker=speaker,
         target_embed=target_embed,
         speaker_weight=args.speaker_weight,
+        spectral=spectral,
+        target_ltas=target_ltas,
+        spectral_weight=args.spectral_weight,
+        f0_target=f0_target,
+        f0_weight=args.f0_weight,
+        duration_weight=args.duration_weight,
+        duration_min_frames=args.duration_min_frames,
         bounds=bounds,
         ground_truth=ground_truth,
         checkpoint_path=ckpt,
