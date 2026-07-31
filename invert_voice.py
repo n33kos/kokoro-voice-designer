@@ -143,6 +143,7 @@ def invert(
     pacing_weight: float,
     reg_weight: float,
     device: str,
+    train_texts: list[str] | None = None,
     ground_truth: torch.Tensor | None = None,
     checkpoint_path: Path | None = None,
     checkpoint_every: int = 5,
@@ -150,7 +151,7 @@ def invert(
 ) -> None:
     """Adam on the style parameters. Hyperparameters follow arXiv 2607.25351."""
     contexts = []
-    for text in TRAIN_TEXTS:
+    for text in (train_texts or TRAIN_TEXTS):
         ps = diff.phonemize(pipeline, text)
         contexts.append((text, ps, diff.build_context(ps)))
     log(f"Training on {len(contexts)} texts, phoneme lengths: "
@@ -306,7 +307,8 @@ def main() -> int:
 
         target_audio = []
         target_rates = {}
-        for text in TRAIN_TEXTS:
+        train_texts = list(TRAIN_TEXTS)
+        for text in train_texts:
             ps = diff.phonemize(gen.pipeline, text)
             ctx = diff.build_context(ps)
             clip = synth_numpy(diff, ctx, gt_voice[len(ps) - 1].to(args.device))
@@ -319,24 +321,38 @@ def main() -> int:
             audio, _ = librosa.load(path, sr=KOKORO_SR, mono=True)
             target_audio.append(torch.from_numpy(audio).float().to(args.device))
             log(f"  target: {Path(path).name}  {len(audio)/KOKORO_SR:.1f}s")
-        # Speaking rate needs a phoneme count, which needs a transcript. Without
-        # --target-text there's no valid rate target, so pacing is left to the
-        # perceptual loss rather than aimed at a made-up number.
+
         if args.target_text:
-            ps = diff.phonemize(gen.pipeline, args.target_text)
+            # Train on the reference clip's own transcript. Pooled WavLM stats
+            # are strongly content-dependent, so matching content collapses the
+            # loss floor from ~0.098 to 0 — the difference between the optimizer
+            # having a reachable target and distorting the voice chasing an
+            # average no single utterance can produce.
+            transcript = Path(args.target_text).read_text().strip() \
+                if Path(args.target_text).exists() else args.target_text
+            train_texts = [transcript]
+            ps = diff.phonemize(gen.pipeline, transcript)
             rate = speaking_rate(len(ps), len(target_audio[0]))
-            target_rates = {t: rate for t in TRAIN_TEXTS}
-            log(f"  measured target rate: {rate:.2f} phonemes/sec")
+            target_rates = {transcript: rate}
+            log(f"  transcript: {len(ps)} phonemes, "
+                f"measured rate {rate:.2f} phonemes/sec")
+            if len(ps) > 510:
+                log(f"  WARNING: transcript exceeds Kokoro's 510-phoneme limit "
+                    f"and will be truncated; use a shorter clip")
         else:
-            log("  no --target-text given; pacing loss disabled")
+            # No transcript means no matched content and no phoneme count, so
+            # neither the low loss floor nor the pacing term is available.
+            train_texts = list(TRAIN_TEXTS)
+            log("  no --target-text: falling back to pooled stats over generic "
+                "texts. Expect a worse result — supply a transcript if you can.")
 
     log("Computing target statistics...")
-    if args.sanity_check:
+    if args.sanity_check or args.target_text:
         # Matched content: one target per training text, so the loss floor is
         # genuinely zero rather than a content-mismatch residual.
         target_stats = {
             text: perceptual.target_stats(a.unsqueeze(0))
-            for text, a in zip(TRAIN_TEXTS, target_audio)
+            for text, a in zip(train_texts, target_audio)
         }
     else:
         stats = [perceptual.target_stats(a.unsqueeze(0)) for a in target_audio]
@@ -351,6 +367,7 @@ def main() -> int:
     invert(
         diff, gen.pipeline, params, perceptual, target_stats, target_rates,
         args.steps, args.lr, args.pacing_weight, args.reg_weight, args.device,
+        train_texts=train_texts,
         ground_truth=ground_truth,
         checkpoint_path=ckpt,
         checkpoint_every=args.checkpoint_every,

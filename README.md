@@ -2,6 +2,44 @@
 
 Interactive voice crafting tool built on [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M). Uses PCA decomposition of voice tensors plus orthogonal discovery probing to find and control the dimensions that shape how a voice sounds.
 
+## The Discovery Catalog and Git LFS
+
+`catalog/discovery_catalog.pt` is ~530MB — well over GitHub's 100MB per-file limit — so it is stored with [Git LFS](https://git-lfs.com).
+
+**If you have Git LFS**, `git clone` fetches it automatically. Otherwise install it and pull:
+
+```bash
+brew install git-lfs   # or: apt install git-lfs
+git lfs install
+git lfs pull
+```
+
+**If you don't want Git LFS**, the repository still clones and the code still runs — you'll get a small text pointer file instead of the catalog, and you can regenerate the real thing yourself (below). Nothing is broken; you just start without a pre-built catalog.
+
+### Regenerating the catalog from scratch
+
+The catalog is built from two inputs: the voice library in `voices/`, and a discovery cache accumulated by probing.
+
+```bash
+# 1. Accumulate discoveries. This is the slow part — the cache grows across
+#    runs, so stop with Ctrl+C whenever you have enough and rerun later to add
+#    more. Expect hours for a cache comparable to the shipped catalog.
+uv run python auto_mode.py \
+  --base-voice voices/af_heart.pt \
+  --target-audio input/your_sample.wav \
+  --target-text "transcript of your sample" \
+  --n-probes 200
+
+# 2. Distill the cache into a catalog (fast — seconds to minutes)
+uv run python build_catalog.py --n-discoveries 1000
+
+# 3. Rebuild the derived maps
+uv run python build_style_map.py
+uv run python label_components.py     # optional: names for raw components
+```
+
+Be aware of the real cost: step 1 writes `output/discovery_cache.pt`, which is gitignored and around 1GB for a mature cache, and it is genuinely slow — the shipped catalog represents many hours of probing. Step 2 onward is quick. If you only want the interactive designer and the style sliders, you do not need the catalog at all; `build_style_map.py` works directly from Kokoro and a base voice.
+
 ## Getting Started
 
 The catalog and component labels are version-controlled, so you can clone and run immediately:
