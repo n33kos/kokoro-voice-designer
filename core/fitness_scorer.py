@@ -16,74 +16,12 @@ class FitnessScorer:
         self.target_wav = preprocess_wav(target_path,source_sr=24000)
         self.target_embed = self.encoder.embed_utterance(self.target_wav)
         self.target_features = self.extract_features(self.target_audio)
-        self.weights = [0.45, 0.45, 0.10]  # [target_similarity, self_similarity, feature_similarity]
-
-    def hybrid_similarity(self, audio: NDArray[np.float32], audio2: NDArray[np.float32],target_similarity: float):
-        features = self.extract_features(audio)
-        self_similarity = self.self_similarity(audio,audio2)
-        target_features_pentalty = self.target_feature_penalty(features)
-
-        #Normalize and make higher = better
-        feature_similarity = (100.0 - target_features_pentalty) / 100.0
-        if feature_similarity < 0.0:
-            feature_similarity = 0.01
-
-        values = [target_similarity, self_similarity, feature_similarity]
-        # Playing around with the weights can greatly affect scoring and random walk behavior
-        weights = self.weights
-        score = (np.sum(weights) / np.sum(np.array(weights) / np.array(values))) * 100.0
-
-        return {
-            "score": score,
-            "target_similarity": target_similarity,
-            "self_similarity": self_similarity,
-            "feature_similarity": feature_similarity
-        }
-
-    def hybrid_similarity_cached(self, audio: NDArray[np.float32], target_similarity: float,
-                                 cached_self_similarity: float):
-        """Like hybrid_similarity but uses a cached self-similarity value, skipping second audio generation."""
-        features = self.extract_features(audio)
-        target_features_pentalty = self.target_feature_penalty(features)
-
-        feature_similarity = (100.0 - target_features_pentalty) / 100.0
-        if feature_similarity < 0.0:
-            feature_similarity = 0.01
-
-        values = [target_similarity, cached_self_similarity, feature_similarity]
-        weights = self.weights
-        score = (np.sum(weights) / np.sum(np.array(weights) / np.array(values))) * 100.0
-
-        return {
-            "score": score,
-            "target_similarity": target_similarity,
-            "self_similarity": cached_self_similarity,
-            "feature_similarity": feature_similarity
-        }
 
     def target_similarity(self,audio: NDArray[np.float32]) -> float:
         audio_wav = preprocess_wav(audio,source_sr=24000)
         audio_embed = self.encoder.embed_utterance(audio_wav)
         similarity = np.inner(audio_embed, self.target_embed)
         return similarity
-
-    def target_feature_penalty(self,features: dict[str, Any]) -> float:
-        """Penalizes for differences in audio features"""
-        # Normalized feature difference compared to target features
-        penalty = 0.0
-        for key, value in features.items():
-            diff = abs((value - self.target_features[key])/self.target_features[key])
-            penalty += diff
-        return penalty
-
-    def self_similarity(self,audio1: NDArray[np.float32], audio2: NDArray[np.float32]) -> float:
-        """Self similarity indicates model stability. Poor self similarity means different input makes different sounding voices"""
-        audio_wav1 = preprocess_wav(audio1,source_sr=24000)
-        audio_embed1 = self.encoder.embed_utterance(audio_wav1)
-
-        audio_wav2 = preprocess_wav(audio2,source_sr=24000)
-        audio_embed2 = self.encoder.embed_utterance(audio_wav2)
-        return np.inner(audio_embed1, audio_embed2)
 
     @staticmethod
     def extract_features(audio: NDArray[np.float32] | NDArray[np.float64], sr: int = 24000) -> dict[str, Any]:

@@ -46,7 +46,6 @@ from core.differentiable_kokoro import DifferentiableKokoro
 from core.perceptual_loss import (
     FRAME_HOP,
     KOKORO_SR,
-    SpectralBalanceLoss,
     WavLMPooledLoss,
     duration_floor_loss,
     f0_reference_stats,
@@ -159,9 +158,6 @@ def invert(
     speaker: SpeakerEmbeddingLoss | None = None,
     target_embed: torch.Tensor | None = None,
     speaker_weight: float = 0.0,
-    spectral: SpectralBalanceLoss | None = None,
-    target_ltas: torch.Tensor | None = None,
-    spectral_weight: float = 0.0,
     f0_target: tuple[float, float] | None = None,
     f0_weight: float = 0.0,
     duration_weight: float = 0.0,
@@ -215,7 +211,7 @@ def invert(
         # the shared objective. Accumulating over all texts makes each step a
         # genuine descent direction.
         opt.zero_grad()
-        totals = {"perceptual": 0.0, "pacing": 0.0, "speaker": 0.0, "spectral": 0.0, "f0": 0.0, "dur": 0.0}
+        totals = {"perceptual": 0.0, "pacing": 0.0, "speaker": 0.0, "f0": 0.0, "dur": 0.0}
         total_loss = 0.0
 
         for text, ps, ctx in contexts:
@@ -252,12 +248,6 @@ def invert(
                 loss = loss + speaker_weight * ls
                 totals["speaker"] += float(ls)
 
-            # Long-term spectral balance. The other terms left a measurable
-            # high-frequency excess that reads as graininess.
-            if spectral is not None and target_ltas is not None and spectral_weight > 0:
-                lsp = spectral(out.audio.unsqueeze(0), target_ltas)
-                loss = loss + spectral_weight * lsp
-                totals["spectral"] += float(lsp)
 
             # Pitch distribution. Generated voices ran ~2x the reference's rate
             # of large pitch excursions, heard as spiking at word ends.
@@ -336,9 +326,6 @@ def main() -> int:
                          "Complements the WavLM term, which optimizes texture "
                          "rather than identity. Note this makes Resemblyzer a "
                          "training target, so evaluate with something else too.")
-    ap.add_argument("--spectral-weight", type=float, default=0.0,
-                    help="Weight on long-term spectral balance matching; targets "
-                         "the high-frequency excess that reads as graininess")
     ap.add_argument("--f0-weight", type=float, default=0.0,
                     help="Weight on matching the reference's log-F0 mean and spread; "
                          "targets excess pitch excursions at word ends")
@@ -486,14 +473,6 @@ def main() -> int:
         target_embed = torch.cat(embeds, dim=0).mean(dim=0, keepdim=True)
         target_embed = target_embed / target_embed.norm(dim=1, keepdim=True)
 
-    spectral = None
-    target_ltas = None
-    if args.spectral_weight > 0:
-        spectral = SpectralBalanceLoss(device=args.device)
-        ltas = [spectral.target_ltas(a.unsqueeze(0)) for a in target_audio]
-        target_ltas = torch.cat(ltas, dim=0).mean(dim=0, keepdim=True)
-        log("Spectral balance target computed from reference audio")
-
     f0_target = None
     if args.f0_weight > 0:
         ref = target_audio[0].detach().cpu().numpy()
@@ -522,9 +501,6 @@ def main() -> int:
         speaker=speaker,
         target_embed=target_embed,
         speaker_weight=args.speaker_weight,
-        spectral=spectral,
-        target_ltas=target_ltas,
-        spectral_weight=args.spectral_weight,
         f0_target=f0_target,
         f0_weight=args.f0_weight,
         duration_weight=args.duration_weight,

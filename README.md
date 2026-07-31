@@ -166,6 +166,10 @@ Scores candidates on held-out text and writes samples for listening.
 
 An older, separate line of work, still used by `auto_mode.py`. PCA over Kokoro's built-in voices finds the axes of greatest variation; discovery probes random directions orthogonal to PCA to find impactful dimensions the voice library doesn't vary along. `build_catalog.py` distills the results.
 
+The server loads the catalog lazily — nothing in the web UI needs it, so it is
+only read if a request arrives using raw component coefficients. Startup is
+otherwise unaffected by its size.
+
 This powers `auto_mode.py`, a coordinate-descent optimizer that predates the gradient-based approach. It fits a voice to a reference recording the same way `invert_voice.py` does, but by black-box search rather than gradients, and it converges to a noticeably worse result for far more compute. Prefer `invert_voice.py`. Discovery remains useful for exploring directions outside the built-in voice distribution.
 
 ### The catalog and Git LFS
@@ -200,11 +204,14 @@ voice-designer/
 ├── build_style_map.py       # Build the slider axes (Jacobian in style space)
 ├── verify_style_map.py      # Check the axes against real synthesis
 ├── evaluate_match.py        # Score candidates against a reference
+├── design_voices.py         # Design original voices from the style axes
 ├── split_reference.py       # Cut a long recording into transcribed clips
 ├── test_differentiable.py   # Gate: our forward pass must match stock Kokoro
 ├── server.py                # FastAPI backend
 ├── auto_mode.py             # Older coordinate-descent loop + discovery
 ├── build_catalog.py         # Distill PCA + discoveries into a catalog
+├── label_components.py      # Name raw components (catalog workflow only)
+├── prune_cache.py           # Trim the discovery cache to top-N
 ├── synthesize.py            # Quick test synthesis from any .pt voice
 ├── core/
 │   ├── differentiable_kokoro.py  # Kokoro forward pass with gradients enabled

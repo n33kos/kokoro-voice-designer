@@ -129,66 +129,6 @@ def load_voice(path: str | Path) -> torch.Tensor:
         return torch.load(path, weights_only=False)
 
 
-def compute_component_labels(
-    components: torch.Tensor,
-    singular_values: torch.Tensor,
-    comp_ranges: torch.Tensor,
-    base_voice: torch.Tensor,
-    gen: SpeechGenerator,
-    text: str = "Hello, how are you today?",
-) -> list[str]:
-    """Run sensitivity analysis and assign human-readable labels to components."""
-    base_flat = base_voice.reshape(-1).float()
-    base_audio = gen.generate_audio(text, base_voice)
-    base_features = FitnessScorer.extract_features(base_audio)
-
-    n_active = components.shape[0]
-    sensitivity: dict[int, dict] = {}
-
-    base_min = float(base_flat.min())
-    base_max = float(base_flat.max())
-    clamp_lo = base_min - abs(base_min) * 2
-    clamp_hi = base_max + abs(base_max) * 2
-
-    for i in range(n_active):
-        component = components[i]
-        scale = float(singular_values[i]) * 0.1
-        perturbed_flat = base_flat + component * scale
-        perturbed_flat = torch.nan_to_num(perturbed_flat, nan=0.0, posinf=clamp_hi, neginf=clamp_lo)
-        perturbed_flat = perturbed_flat.clamp(clamp_lo, clamp_hi)
-        perturbed_voice = perturbed_flat.reshape(base_voice.shape)
-        try:
-            audio = gen.generate_audio(text, perturbed_voice)
-            features = FitnessScorer.extract_features(audio)
-            deltas = {}
-            for key in base_features:
-                bv = base_features[key]
-                nv = features[key]
-                deltas[key] = (nv - bv) / abs(bv) if abs(bv) > 1e-8 else (nv - bv)
-            sensitivity[i] = deltas
-        except Exception:
-            sensitivity[i] = {k: 0.0 for k in base_features}
-
-    # Assign names
-    used_names: set[str] = set()
-    names: list[str] = []
-    for i in range(n_active):
-        deltas = sensitivity.get(i, {})
-        scale_factor = float(comp_ranges[i]) / (float(singular_values[i]) * 0.1) if float(singular_values[i]) * 0.1 > 0 else 1.0
-        scaled = {k: abs(v) * scale_factor for k, v in deltas.items()}
-        sorted_feats = sorted(scaled.items(), key=lambda x: x[1], reverse=True)
-        name = f"component {i}"
-        for feat, _ in sorted_feats:
-            if feat in FEATURE_LABELS:
-                base_name = FEATURE_LABELS[feat]
-                if base_name not in used_names:
-                    name = base_name
-                    used_names.add(base_name)
-                    break
-        names.append(name)
-    return names
-
-
 def _default_component_names(n_pca_count: int, total: int) -> list[str]:
     """Fallback label assignment: cycle through FEATURE_LABELS for all components."""
     label_list = list(FEATURE_LABELS.values())
@@ -213,96 +153,7 @@ async def startup():
     print("[server] Initializing Kokoro pipeline...")
     speech_gen = SpeechGenerator()
 
-    # Load voices for PCA / ranges
-    pt_files = sorted(f for f in os.listdir(VOICES_DIR) if f.endswith(".pt"))
-    voice_tensors = [load_voice(VOICES_DIR / f) for f in pt_files]
-    voice_shape_val = voice_tensors[0].shape
-    voice_shape = voice_shape_val
-    n_voices = len(voice_tensors)
-
-    # Load catalog or compute PCA
-    catalog = None
-    if DEFAULT_CATALOG.exists():
-        try:
-            catalog = torch.load(DEFAULT_CATALOG, weights_only=False)
-            print(f"[server] Loaded catalog: {catalog.get('pca_n_components', 0)} PCA + "
-                  f"{len(catalog.get('discovered_impacts', []))} discoveries")
-        except Exception as e:
-            print(f"[server] Could not load catalog: {e}")
-
-    if catalog is not None:
-        n_pca = catalog.get("pca_n_components", 0)
-        pca_comps = catalog["pca_components"][:n_pca]
-        pca_sv = catalog["pca_singular_values"][:n_pca]
-        pca_mean = catalog["pca_mean"]
-        analyzer_mean = pca_mean
-
-        # Discovery components
-        disc_comps = catalog.get("discovered_components")
-        if disc_comps is not None and disc_comps.shape[0] > 0:
-            avg_sv = float(pca_sv.mean())
-            disc_sv = torch.full((disc_comps.shape[0],), avg_sv)
-            all_comps_parts = [pca_comps, disc_comps]
-            all_sv_parts = [pca_sv, disc_sv]
-        else:
-            all_comps_parts = [pca_comps]
-            all_sv_parts = [pca_sv]
-            disc_comps = None
-
-        all_components = torch.cat(all_comps_parts, dim=0)
-        all_sv = torch.cat(all_sv_parts, dim=0)
-
-        # Component ranges
-        flat = torch.stack(voice_tensors).reshape(n_voices, -1).float()
-        centered = flat - analyzer_mean
-        projections = centered @ all_components.T
-        component_ranges = projections.max(dim=0).values - projections.min(dim=0).values
-
-        # Fix discovery ranges
-        n_pca_actual = pca_comps.shape[0]
-        if disc_comps is not None and disc_comps.shape[0] > 0:
-            avg_pca_range = float(component_ranges[:n_pca_actual].mean())
-            component_ranges[n_pca_actual:] = avg_pca_range
-
-        catalog_data = catalog
-    else:
-        # Compute PCA from voices
-        n_pca = min(n_voices - 1, 20)
-        analyzer = VoiceAnalyzer(voice_tensors, n_components=n_pca)
-        pca_comps = analyzer.components
-        pca_sv = analyzer.singular_values
-        pca_mean = analyzer.mean
-
-        all_components = pca_comps
-        all_sv = pca_sv
-
-        flat = torch.stack(voice_tensors).reshape(n_voices, -1).float()
-        centered = flat - pca_mean
-        projections = centered @ all_components.T
-        component_ranges = projections.max(dim=0).values - projections.min(dim=0).values
-
-    component_count = all_components.shape[0]
-    pca_count = pca_comps.shape[0]
-
-    # Assign labels: prefer labels from file, fall back to FEATURE_LABELS / "d{N}"
-    if COMPONENT_LABELS_FILE.exists():
-        try:
-            with open(COMPONENT_LABELS_FILE, "r") as f:
-                file_labels = json.load(f)
-            # Use file labels up to component_count, pad with dN if file is shorter
-            component_names = []
-            for i in range(component_count):
-                if i < len(file_labels):
-                    component_names.append(file_labels[i])
-                else:
-                    component_names.append(f"d{i}")
-            print(f"[server] Loaded {len(file_labels)} labels from {COMPONENT_LABELS_FILE}")
-        except Exception as e:
-            print(f"[server] Could not load labels file ({e}), using defaults")
-            component_names = _default_component_names(pca_comps.shape[0], component_count)
-    else:
-        component_names = _default_component_names(pca_comps.shape[0], component_count)
-
+    # Style map is small and always needed; the component catalog is not.
     # Load style map (v2) if available
     global style_feature_names, style_directions, has_style_map
     if STYLE_MAP_FILE.exists():
@@ -319,6 +170,118 @@ async def startup():
 
     print(f"[server] Ready. {component_count} components: {', '.join(component_names[:10])}...")
 
+
+
+
+def ensure_components_loaded() -> bool:
+    """Load the PCA/discovery component space on first use.
+
+    The catalog is ~530MB and takes tens of seconds to load, but nothing in the
+    web UI needs it — the style sliders operate directly on Kokoro's 256-dim
+    style space. Only the legacy raw-coefficient API path uses components, so
+    this defers the cost to a request that actually needs it. Most servers never
+    pay it at all.
+    """
+    global catalog_data, component_names, component_count, pca_count
+    global all_components, component_ranges, pca_mean, voice_shape
+
+    if all_components is not None:
+        return True
+    try:
+        print("[server] Loading component catalog (first raw-coefficient request)...")
+        # Load voices for PCA / ranges
+        pt_files = sorted(f for f in os.listdir(VOICES_DIR) if f.endswith(".pt"))
+        voice_tensors = [load_voice(VOICES_DIR / f) for f in pt_files]
+        voice_shape_val = voice_tensors[0].shape
+        voice_shape = voice_shape_val
+        n_voices = len(voice_tensors)
+
+        # Load catalog or compute PCA
+        catalog = None
+        if DEFAULT_CATALOG.exists():
+            try:
+                catalog = torch.load(DEFAULT_CATALOG, weights_only=False)
+                print(f"[server] Loaded catalog: {catalog.get('pca_n_components', 0)} PCA + "
+                      f"{len(catalog.get('discovered_impacts', []))} discoveries")
+            except Exception as e:
+                print(f"[server] Could not load catalog: {e}")
+
+        if catalog is not None:
+            n_pca = catalog.get("pca_n_components", 0)
+            pca_comps = catalog["pca_components"][:n_pca]
+            pca_sv = catalog["pca_singular_values"][:n_pca]
+            pca_mean = catalog["pca_mean"]
+            analyzer_mean = pca_mean
+
+            # Discovery components
+            disc_comps = catalog.get("discovered_components")
+            if disc_comps is not None and disc_comps.shape[0] > 0:
+                avg_sv = float(pca_sv.mean())
+                disc_sv = torch.full((disc_comps.shape[0],), avg_sv)
+                all_comps_parts = [pca_comps, disc_comps]
+                all_sv_parts = [pca_sv, disc_sv]
+            else:
+                all_comps_parts = [pca_comps]
+                all_sv_parts = [pca_sv]
+                disc_comps = None
+
+            all_components = torch.cat(all_comps_parts, dim=0)
+            all_sv = torch.cat(all_sv_parts, dim=0)
+
+            # Component ranges
+            flat = torch.stack(voice_tensors).reshape(n_voices, -1).float()
+            centered = flat - analyzer_mean
+            projections = centered @ all_components.T
+            component_ranges = projections.max(dim=0).values - projections.min(dim=0).values
+
+            # Fix discovery ranges
+            n_pca_actual = pca_comps.shape[0]
+            if disc_comps is not None and disc_comps.shape[0] > 0:
+                avg_pca_range = float(component_ranges[:n_pca_actual].mean())
+                component_ranges[n_pca_actual:] = avg_pca_range
+
+            catalog_data = catalog
+        else:
+            # Compute PCA from voices
+            n_pca = min(n_voices - 1, 20)
+            analyzer = VoiceAnalyzer(voice_tensors, n_components=n_pca)
+            pca_comps = analyzer.components
+            pca_sv = analyzer.singular_values
+            pca_mean = analyzer.mean
+
+            all_components = pca_comps
+            all_sv = pca_sv
+
+            flat = torch.stack(voice_tensors).reshape(n_voices, -1).float()
+            centered = flat - pca_mean
+            projections = centered @ all_components.T
+            component_ranges = projections.max(dim=0).values - projections.min(dim=0).values
+
+        component_count = all_components.shape[0]
+        pca_count = pca_comps.shape[0]
+
+        # Assign labels: prefer labels from file, fall back to FEATURE_LABELS / "d{N}"
+        if COMPONENT_LABELS_FILE.exists():
+            try:
+                with open(COMPONENT_LABELS_FILE, "r") as f:
+                    file_labels = json.load(f)
+                # Use file labels up to component_count, pad with dN if file is shorter
+                component_names = []
+                for i in range(component_count):
+                    if i < len(file_labels):
+                        component_names.append(file_labels[i])
+                    else:
+                        component_names.append(f"d{i}")
+                print(f"[server] Loaded {len(file_labels)} labels from {COMPONENT_LABELS_FILE}")
+            except Exception as e:
+                print(f"[server] Could not load labels file ({e}), using defaults")
+                component_names = _default_component_names(pca_comps.shape[0], component_count)
+        else:
+            component_names = _default_component_names(pca_comps.shape[0], component_count)
+        return True
+    except Exception as e:
+        print(f"[server] Could not load components: {e}")
+        return False
 
 # ---------------------------------------------------------------------------
 # API models
@@ -345,7 +308,7 @@ class ExportVoiceRequest(BaseModel):
 # ---------------------------------------------------------------------------
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "components": component_count}
+    return {"status": "ok", "styleMap": has_style_map, "components": component_count}
 
 
 @app.get("/api/voices")
@@ -357,11 +320,10 @@ async def list_voices():
 
 @app.get("/api/catalog")
 async def get_catalog():
+    # Deliberately does not trigger the component load — the UI only needs the
+    # style features, and forcing a 530MB read here would defeat lazy loading.
     result: dict = {
-        "components": [
-            {"index": i, "name": component_names[i]}
-            for i in range(component_count)
-        ],
+        "components": [],
         "count": component_count,
         "pcaCount": pca_count,
     }
@@ -377,8 +339,7 @@ async def get_catalog():
 
 @app.post("/api/export-voice")
 async def export_voice(req: ExportVoiceRequest):
-    if all_components is None or component_ranges is None:
-        raise HTTPException(status_code=503, detail="Server not ready")
+
 
     voice_path = VOICES_DIR / req.voice
     if not voice_path.exists():
@@ -389,6 +350,9 @@ async def export_voice(req: ExportVoiceRequest):
     if req.styleCoefficients is not None and has_style_map:
         voice_flat = apply_style_deltas(base_voice, req.styleCoefficients).reshape(-1)
     else:
+        if not ensure_components_loaded():
+            raise HTTPException(status_code=503,
+                                detail="Component catalog unavailable; send styleCoefficients instead")
         # Build coefficient tensor
         coeffs = torch.zeros(component_count)
         for i, c in enumerate(req.coefficients[:component_count]):
@@ -464,7 +428,7 @@ async def upload_voice(file: UploadFile):
 
 @app.post("/api/synthesize")
 async def synthesize(req: SynthesizeRequest):
-    if speech_gen is None or all_components is None or component_ranges is None:
+    if speech_gen is None:
         raise HTTPException(status_code=503, detail="Server not ready")
 
     voice_path = VOICES_DIR / req.voice
@@ -476,6 +440,9 @@ async def synthesize(req: SynthesizeRequest):
     if req.styleCoefficients is not None and has_style_map:
         voice_flat = apply_style_deltas(base_voice, req.styleCoefficients).reshape(-1)
     else:
+        if not ensure_components_loaded():
+            raise HTTPException(status_code=503,
+                                detail="Component catalog unavailable; send styleCoefficients instead")
         # Build coefficient tensor
         coeffs = torch.zeros(component_count)
         for i, c in enumerate(req.coefficients[:component_count]):
