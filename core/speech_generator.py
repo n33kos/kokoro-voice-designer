@@ -16,12 +16,28 @@ def get_device() -> str:
 
 
 class SpeechGenerator:
-    def __init__(self, device: str | None = None):
+    """Kokoro wrapper.
+
+    `seed` makes synthesis reproducible. Kokoro's vocoder is stochastic — its
+    harmonic-plus-noise source module draws a random initial phase and injects
+    noise (see kokoro/istftnet.py) — so identical inputs otherwise produce
+    different audio, with peak differences around 0.13. That puts a noise floor
+    under any similarity metric: two runs of the *same* voice score ~0.9985 on
+    Resemblyzer rather than 1.0.
+
+    For search and comparison (auto mode, discovery), pass a seed so that a
+    measured difference reflects the voice change rather than sampling noise.
+    """
+
+    def __init__(self, device: str | None = None, seed: int | None = None):
         surpressWarnings()
         self.device = device or get_device()
+        self.seed = seed
         self.pipeline = KPipeline(lang_code="a", repo_id='hexgrad/Kokoro-82M', device=self.device)
 
     def generate_audio(self, text: str, voice: torch.Tensor,speed: float = 1.0) -> np.typing.NDArray[np.float32]:
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
         generator = self.pipeline(text, voice, speed)
         audio = []
         for gs, ps, chunk in generator:

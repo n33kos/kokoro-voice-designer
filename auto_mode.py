@@ -473,6 +473,14 @@ def main() -> None:
     parser.add_argument("--mag-steps", type=int, default=3, help="Magnitude step reductions (10x each)")
     parser.add_argument("--output-dir", type=str, default=str(OUTPUT_DIR), help="Output directory")
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=1234,
+        help="Synthesis seed. Kokoro's vocoder is stochastic; seeding removes the "
+             "~0.0015 similarity noise floor that lets tiny gains look real. "
+             "Pass a negative value to disable.",
+    )
+    parser.add_argument(
         "--keep-base",
         action="store_true",
         help="Always start from the original base voice instead of carrying over tuning",
@@ -483,7 +491,11 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     log("Initializing Kokoro pipeline...")
-    speech_gen = SpeechGenerator()
+    # Seeded: Kokoro's vocoder is stochastic, and coordinate descent accepts any
+    # improvement. Unseeded, two syntheses of the same voice differ by ~0.0015
+    # Resemblyzer similarity, so steps smaller than that were being accepted on
+    # sampling noise rather than a real gain.
+    speech_gen = SpeechGenerator(seed=args.seed if args.seed >= 0 else None)
 
     log("Loading target audio and initializing fitness scorer...")
     target_wav_path = convert_audio(args.target_audio)

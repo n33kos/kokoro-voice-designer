@@ -5,7 +5,12 @@ const DEBOUNCE_MS = 400;
 
 export interface VoiceSynthesisHook {
   loading: boolean;
-  requestSynthesis: (voice: string, coefficients: number[], text: string) => void;
+  requestSynthesis: (
+    voice: string,
+    coefficients: number[],
+    text: string,
+    styleCoefficients?: number[],
+  ) => void;
 }
 
 export function useVoiceSynthesis(
@@ -17,7 +22,7 @@ export function useVoiceSynthesis(
   const requestIdRef = useRef(0);
 
   const requestSynthesis = useCallback(
-    (voice: string, coefficients: number[], text: string) => {
+    (voice: string, coefficients: number[], text: string, styleCoefficients?: number[]) => {
       // Clear pending debounce
       if (timerRef.current) {
         clearTimeout(timerRef.current);
@@ -34,7 +39,7 @@ export function useVoiceSynthesis(
         setLoading(true);
 
         try {
-          const buffer = await synthesize({ voice, coefficients, text });
+          const buffer = await synthesize({ voice, coefficients, text, styleCoefficients });
           // Only use result if this is still the latest request
           if (id === requestIdRef.current) {
             onAudioReady(buffer);

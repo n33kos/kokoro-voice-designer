@@ -247,11 +247,13 @@ voice-designer/
 ├── auto_mode.py            # Headless continuous refinement loop
 ├── synthesize.py           # Quick test synthesis from any .pt voice
 ├── build_catalog.py        # Distill PCA + top discoveries into a catalog
+├── build_semantic_map.py   # Build semantic directions from catalog sensitivity
 ├── label_components.py     # Label components via sensitivity analysis
 ├── prune_cache.py          # Trim working discovery cache to top-N
 ├── catalog/                # Version-controlled discovery catalog
 │   ├── discovery_catalog.pt
-│   └── component_labels.json  # Human-readable labels for each component
+│   ├── component_labels.json  # Human-readable labels for each component
+│   └── semantic_map.json      # Semantic directions for disentangled sliders
 ├── core/
 │   ├── voice_analyzer.py   # PCA decomposition + sensitivity
 │   ├── speech_generator.py # Kokoro TTS wrapper
@@ -273,3 +275,104 @@ voice-designer/
 - Use 20 components for coarse shaping, expand higher values for fine detail
 - Run Discovery to accumulate a cache, then `build_catalog.py` to distill it — the catalog grows better over time
 - When Auto-Tune plateaus, try reducing step size, increasing magnitude steps, or rebuilding the catalog with more discoveries
+
+## How Kokoro Stores a Voice
+
+Worth understanding before the sections below, because it reframes what the tools are doing.
+
+A `.pt` voice file is `[510, 1, 256]`, but it is **not** a 130,560-dimensional description of a voice. Kokoro's pipeline indexes it by phoneme count:
+
+```python
+# kokoro/pipeline.py
+return model(ps, pack[len(ps)-1], speed, return_output=True)
+```
+
+It is **510 separate 256-dim style vectors**, and one utterance uses exactly one of them — the row matching its phoneme count. Within that row, the model splits the 256 dims cleanly:
+
+```python
+# kokoro/model.py
+s = ref_s[:, 128:]                                            # prosody predictor
+audio = self.decoder(asr, F0_pred, N_pred, ref_s[:, :128])    # decoder
+```
+
+- **`[:128]` — timbre.** Feeds the decoder. Vocal tract, formants, who is speaking.
+- **`[128:]` — prosody.** Feeds duration, F0 and energy prediction. Pacing, rhythm, intonation.
+
+Measured across the 510 rows, timbre varies only ~15% while prosody varies ~55% — the length indexing exists mostly to modulate prosody. This is why the newer tools optimize one shared timbre vector plus a smooth prosody profile rather than treating all 130,560 numbers as free.
+
+Two further properties, both verified rather than assumed:
+
+- **Synthesis is stochastic.** The vocoder draws a random initial phase and injects noise (`kokoro/istftnet.py`), so identical inputs produce different audio — peak difference ~0.13. Resemblyzer scores two identical runs at ~0.9985, not 1.0, which is a noise floor for any similarity-based search. Call `torch.manual_seed()` before synthesis when you need reproducibility.
+- **The decoder emits exactly 600 audio samples per predicted duration frame** at 24kHz.
+
+## Style Sliders (v2)
+
+The spider chart's **Style** mode uses axes measured in Kokoro's native 256-dim style space. This supersedes the older Semantic mode (below), which worked in PCA/discovery component space.
+
+Built by `build_style_map.py`, which differs from the older approach in four ways:
+
+1. **Exact gradients, not finite differences.** `core/differentiable_kokoro.py` reimplements Kokoro's forward pass without its `@torch.no_grad()` decorator, so each feature's sensitivity comes from one backward pass. Twelve features means twelve backward passes, versus 1055 syntheses for the old map — seconds instead of minutes, and exact rather than noisy.
+2. **The right space.** The Jacobian is `[12 features x 256 dims]`. Inverting that is well-conditioned, unlike pseudo-inverting `[1055, 20]`.
+3. **Structural disentanglement.** Each axis is masked to the half that architecturally controls it, so a pitch slider *cannot* move timbre. Measured gradient share confirms the split is real: pace, pitch and energy are 100.0% prosody-half, while the spectral features are 80–92% timbre-half.
+4. **Calibrated sliders.** Slider at 1.0 means "change this feature by 30% of the base voice's value," rather than an arbitrary scale.
+
+Five axes are read straight off the model's internals rather than estimated from audio — `pace` from the continuous duration, `pitch`/`pitch variation` from `F0_pred`, `energy`/`energy variation` from `N_pred`. These are exact. The remaining seven (brightness, fullness, breathiness, sibilance, warmth, volume, dynamics) are measured on the waveform with differentiable spectral features in `core/spectral_features.py`.
+
+```bash
+# Build the map (about 40 seconds)
+uv run python build_style_map.py
+
+# Verify it by actually synthesizing, on held-out text
+uv run python verify_style_map.py
+```
+
+`verify_style_map.py` matters: the Jacobian is a *local linearization* of a nonlinear model, so the predicted behavior has to be checked against real synthesis. Current measured results on held-out text, sliders at 1.0 with a 30% target:
+
+- 9 of 12 axes land within a few points of +30%; breathiness (+13.8%) and brightness (+15.2%) under-deliver.
+- Mean worst-case cross-talk is 8.4%. The linear prediction claims 0.02%, so most remaining entanglement is nonlinearity, not a flaw in the inversion.
+- The largest leaks are between physically coupled features (brightness/breathiness, warmth/sibilance) — genuine perceptual correlation, not a bug.
+
+Regenerate the map when you change base voice; it is a local approximation around whichever voice it was built on.
+
+## Semantic Voice Sliders (v1, superseded)
+
+Kept for comparison against Style mode. The web UI supports these modes for the spider chart, toggled above the chart:
+
+- **Raw mode** (default): One axis per PCA/discovery component. Each axis represents one direction in voice tensor space. Labels are approximate — adjusting one component may subtly affect multiple audio features.
+- **Semantic mode**: One axis per audio feature (pitch, brightness, breathiness, etc.). Each slider maps to a learned weighted combination of raw components that maximally changes one feature while minimally affecting others. This produces cleaner, more intuitive control.
+
+### How it works
+
+1. **Dense sensitivity matrix.** `build_semantic_map.py` perturbs each catalog component and measures the delta across all 20 tracked audio features (pitch, spectral centroid, MFCCs, energy, etc.), producing an N x M matrix `S[i,j]` = how much component `i` affects feature `j`.
+
+2. **Pseudo-inverse for disentangled directions.** The pseudo-inverse `S+` (M x N) is computed so each row is a set of component weights that maximally changes one audio feature while minimally affecting others.
+
+3. **Frontend mapping.** In semantic mode, the frontend multiplies the semantic coefficient vector by the directions matrix to compute raw coefficients: `raw_coeffs = semanticCoeffs @ directions`. The raw coefficients are sent to the same `/api/synthesize` endpoint.
+
+### Generating / regenerating the semantic map
+
+```bash
+# Generate from the default catalog and voice
+uv run python build_semantic_map.py
+
+# Use a specific base voice and text
+uv run python build_semantic_map.py --voice voices/af_heart.pt --text "Hello there."
+
+# Custom output path
+uv run python build_semantic_map.py --output catalog/semantic_map_v2.json
+```
+
+This requires one Kokoro synthesis per component, so it takes a few minutes for large catalogs. The result is saved to `catalog/semantic_map.json` and loaded automatically by the server on startup.
+
+Re-running after catalog improvements (more discoveries, updated PCA) updates the mapping to reflect the new component space.
+
+### Full workflow
+
+1. **Discover** new voice directions with `auto_mode.py`
+2. **Build catalog** with `uv run python build_catalog.py`
+3. **Build semantic map** with `uv run python build_semantic_map.py`
+4. **Use in web UI** — start the server and frontend, toggle to Semantic mode
+
+### Limitations
+
+Perfect disentanglement is not possible — some audio features are physically correlated (e.g., pitch and spectral centroid). The mapping provides substantially more intuitive control than raw components, but adjusting one semantic slider may still produce small shifts in correlated features.

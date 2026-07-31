@@ -7,9 +7,16 @@ import PlaybackControls from './components/PlaybackControls';
 import { useAudioEngine } from './hooks/useAudioEngine';
 import { useVoiceSynthesis } from './hooks/useVoiceSynthesis';
 import { fetchVoices, fetchCatalog, exportVoice, uploadVoice } from './api';
-import type { VoiceInfo, ComponentInfo } from './types';
+import type { VoiceInfo, ComponentInfo, SemanticFeature, StyleFeature } from './types';
 
 const DEFAULT_TEXT = 'Hello, my name is Alex. How can I help you today?';
+
+/**
+ * 'style' is the v2 map: axes in Kokoro's native 256-dim style space, measured
+ * by backpropagation and masked to the half that controls them. 'semantic' is
+ * the older component-space map, kept while the two are compared.
+ */
+type Mode = 'raw' | 'semantic' | 'style';
 
 export default function App() {
   const [voices, setVoices] = useState<VoiceInfo[]>([]);
@@ -21,6 +28,14 @@ export default function App() {
   const [ready, setReady] = useState(false);
   const [initError, setInitError] = useState<string | null>(null);
   const [exportingVoice, setExportingVoice] = useState(false);
+  const [mode, setMode] = useState<Mode>('raw');
+  const [semanticCoefficients, setSemanticCoefficients] = useState<number[]>([]);
+  const [semanticFeatures, setSemanticFeatures] = useState<SemanticFeature[]>([]);
+  const [semanticDirections, setSemanticDirections] = useState<number[][] | null>(null);
+  const [hasSemanticMap, setHasSemanticMap] = useState(false);
+  const [styleCoefficients, setStyleCoefficients] = useState<number[]>([]);
+  const [styleFeatures, setStyleFeatures] = useState<StyleFeature[]>([]);
+  const [hasStyleMap, setHasStyleMap] = useState(false);
 
   const audioEngine = useAudioEngine();
   const { loading, requestSynthesis } = useVoiceSynthesis(
@@ -47,6 +62,24 @@ export default function App() {
         if (cancelled) return;
         setVoices(voicesRes.voices);
         setComponents(catalogRes.components);
+        if (catalogRes.hasSemanticMap && catalogRes.semanticFeatures && catalogRes.semanticDirections) {
+          setHasSemanticMap(true);
+          setSemanticFeatures(catalogRes.semanticFeatures);
+          // Directions arrive L1-normalized from build_semantic_map.py, which
+          // bounds the summed perturbation to roughly one raw slider at 1.0.
+          // Don't renormalize here — doing so discards that scaling and lets
+          // sliders past ~0.25 distort.
+          setSemanticDirections(catalogRes.semanticDirections);
+          setSemanticCoefficients(new Array(catalogRes.semanticFeatures.length).fill(0));
+        }
+        if (catalogRes.hasStyleMap && catalogRes.styleFeatures) {
+          setHasStyleMap(true);
+          setStyleFeatures(catalogRes.styleFeatures);
+          setStyleCoefficients(new Array(catalogRes.styleFeatures.length).fill(0));
+          // Style axes are both more accurate and more meaningful than raw
+          // components, so lead with them when they're available.
+          setMode('style');
+        }
         // Keep the hardcoded default of 20; don't override from catalog
         if (voicesRes.voices.length > 0) {
           // Pick af_heart if available, else first
@@ -69,21 +102,36 @@ export default function App() {
     };
   }, []);
 
+  /**
+   * Synthesize with whichever coefficient set the current mode owns. Style mode
+   * sends slider values only — the server holds the 256-dim directions.
+   */
+  const resynthesize = useCallback(
+    (voice: string, newText: string) => {
+      if (mode === 'style') {
+        requestSynthesis(voice, [], newText, styleCoefficients);
+      } else {
+        requestSynthesis(voice, coefficients, newText);
+      }
+    },
+    [mode, coefficients, styleCoefficients, requestSynthesis],
+  );
+
   // Trigger initial synthesis once ready
   useEffect(() => {
     if (ready && selectedVoice && text && !initialSynthDone.current) {
       initialSynthDone.current = true;
-      requestSynthesis(selectedVoice, coefficients, text);
+      resynthesize(selectedVoice, text);
     }
-  }, [ready, selectedVoice, text, coefficients, requestSynthesis]);
+  }, [ready, selectedVoice, text, resynthesize]);
 
   // Re-synthesize when voice or text changes (but not on initial load)
   const handleVoiceChange = useCallback(
     (filename: string) => {
       setSelectedVoice(filename);
-      requestSynthesis(filename, coefficients, text);
+      resynthesize(filename, text);
     },
-    [coefficients, text, requestSynthesis],
+    [text, resynthesize],
   );
 
   const handleVoiceUpload = useCallback(
@@ -95,41 +143,93 @@ export default function App() {
         setVoices(voicesRes.voices);
         // Select the uploaded voice
         setSelectedVoice(result.filename);
-        requestSynthesis(result.filename, coefficients, text);
+        resynthesize(result.filename, text);
       } catch (err) {
         console.error('Voice upload failed:', err);
       }
     },
-    [coefficients, text, requestSynthesis],
+    [text, resynthesize],
   );
 
   const handleTextChange = useCallback(
     (newText: string) => {
       setText(newText);
       if (newText.trim()) {
-        requestSynthesis(selectedVoice, coefficients, newText);
+        resynthesize(selectedVoice, newText);
       }
     },
-    [selectedVoice, coefficients, requestSynthesis],
+    [selectedVoice, resynthesize],
+  );
+
+  /** Multiply semantic coefficients by directions matrix to get raw coefficients */
+  const semanticToRaw = useCallback(
+    (semCoeffs: number[]): number[] => {
+      if (!semanticDirections) return new Array(components.length).fill(0);
+      const nComponents = components.length;
+      const raw = new Array(nComponents).fill(0);
+      for (let i = 0; i < semCoeffs.length; i++) {
+        if (Math.abs(semCoeffs[i]) < 1e-10) continue;
+        const dir = semanticDirections[i];
+        if (!dir) continue;
+        for (let j = 0; j < nComponents && j < dir.length; j++) {
+          raw[j] += semCoeffs[i] * dir[j];
+        }
+      }
+      return raw;
+    },
+    [semanticDirections, components.length],
   );
 
   const handleAxisChange = useCallback(
     (index: number, value: number) => {
-      setCoefficients((prev) => {
-        const next = [...prev];
-        next[index] = value;
-        requestSynthesis(selectedVoice, next, text);
-        return next;
-      });
+      if (mode === 'style') {
+        // Style directions live server-side in 256-dim space; we only send
+        // slider values and the server applies the offsets during synthesis.
+        setStyleCoefficients((prev) => {
+          const next = [...prev];
+          next[index] = value;
+          requestSynthesis(selectedVoice, [], text, next);
+          return next;
+        });
+      } else if (mode === 'semantic') {
+        setSemanticCoefficients((prev) => {
+          const next = [...prev];
+          next[index] = value;
+          const rawCoeffs = semanticToRaw(next);
+          setCoefficients(rawCoeffs);
+          requestSynthesis(selectedVoice, rawCoeffs, text);
+          return next;
+        });
+      } else {
+        setCoefficients((prev) => {
+          const next = [...prev];
+          next[index] = value;
+          requestSynthesis(selectedVoice, next, text);
+          return next;
+        });
+      }
     },
-    [selectedVoice, text, requestSynthesis],
+    [mode, selectedVoice, text, requestSynthesis, semanticToRaw],
   );
 
   const handleReset = useCallback(() => {
-    const zeroed = new Array(components.length).fill(0);
-    setCoefficients(zeroed);
-    requestSynthesis(selectedVoice, zeroed, text);
-  }, [components.length, selectedVoice, text, requestSynthesis]);
+    if (mode === 'style') {
+      const zeroed = new Array(styleFeatures.length).fill(0);
+      setStyleCoefficients(zeroed);
+      requestSynthesis(selectedVoice, [], text, zeroed);
+    } else if (mode === 'semantic') {
+      const zeroed = new Array(semanticFeatures.length).fill(0);
+      setSemanticCoefficients(zeroed);
+      const rawZeroed = new Array(components.length).fill(0);
+      setCoefficients(rawZeroed);
+      requestSynthesis(selectedVoice, rawZeroed, text);
+    } else {
+      const zeroed = new Array(components.length).fill(0);
+      setCoefficients(zeroed);
+      requestSynthesis(selectedVoice, zeroed, text);
+    }
+  }, [mode, components.length, semanticFeatures.length, styleFeatures.length,
+      selectedVoice, text, requestSynthesis]);
 
   const triggerDownload = useCallback((data: ArrayBuffer, filename: string, mime: string) => {
     const blob = new Blob([data], { type: mime });
@@ -162,6 +262,31 @@ export default function App() {
     triggerDownload(wavBuffer, 'designed_voice.wav', 'audio/wav');
   }, [audioEngine, triggerDownload]);
 
+  const handleModeChange = useCallback(
+    (newMode: Mode) => {
+      if (newMode === mode) return;
+      setMode(newMode);
+      if (newMode === 'style') {
+        const zeroed = new Array(styleFeatures.length).fill(0);
+        setStyleCoefficients(zeroed);
+        requestSynthesis(selectedVoice, [], text, zeroed);
+      } else if (newMode === 'semantic') {
+        // Reset semantic coefficients when switching to semantic mode
+        setSemanticCoefficients(new Array(semanticFeatures.length).fill(0));
+        const rawZeroed = new Array(components.length).fill(0);
+        setCoefficients(rawZeroed);
+        requestSynthesis(selectedVoice, rawZeroed, text);
+      } else {
+        // Reset raw coefficients when switching to raw mode
+        const zeroed = new Array(components.length).fill(0);
+        setCoefficients(zeroed);
+        requestSynthesis(selectedVoice, zeroed, text);
+      }
+    },
+    [mode, semanticFeatures.length, styleFeatures.length, components.length,
+     selectedVoice, text, requestSynthesis],
+  );
+
   if (initError) {
     return (
       <div className={styles.app}>
@@ -184,9 +309,24 @@ export default function App() {
     );
   }
 
-  const visibleCount = Math.min(displayCount, components.length);
-  const visibleLabels = components.slice(0, visibleCount).map((c) => c.name);
-  const visibleValues = coefficients.slice(0, visibleCount);
+  const isSemantic = mode === 'semantic';
+  const isStyle = mode === 'style';
+  const rawCount = Math.min(displayCount, components.length);
+  const chartLabels = isStyle
+    ? styleFeatures.map((f) => f.name)
+    : isSemantic
+      ? semanticFeatures.map((f) => f.name)
+      : components.slice(0, rawCount).map((c) => c.name);
+  const chartValues = isStyle
+    ? styleCoefficients
+    : isSemantic
+      ? semanticCoefficients
+      : coefficients.slice(0, rawCount);
+  const visibleCount = isStyle
+    ? styleFeatures.length
+    : isSemantic
+      ? semanticFeatures.length
+      : rawCount;
 
   return (
     <div className={styles.app}>
@@ -199,24 +339,54 @@ export default function App() {
 
       <main className={styles.main}>
         <div className={styles.chartPanel}>
+          {(hasSemanticMap || hasStyleMap) && (
+            <div className={styles.modeToggle}>
+              {hasStyleMap && (
+                <button
+                  className={`${styles.modeBtn} ${isStyle ? styles.modeBtnActive : ''}`}
+                  onClick={() => handleModeChange('style')}
+                  title="Axes in Kokoro's native style space, measured by backpropagation"
+                >
+                  Style
+                </button>
+              )}
+              <button
+                className={`${styles.modeBtn} ${mode === 'raw' ? styles.modeBtnActive : ''}`}
+                onClick={() => handleModeChange('raw')}
+              >
+                Raw
+              </button>
+              {hasSemanticMap && (
+                <button
+                  className={`${styles.modeBtn} ${isSemantic ? styles.modeBtnActive : ''}`}
+                  onClick={() => handleModeChange('semantic')}
+                  title="Older component-space map"
+                >
+                  Semantic
+                </button>
+              )}
+            </div>
+          )}
           <SpiderChart
-            labels={visibleLabels}
-            values={visibleValues}
+            labels={chartLabels}
+            values={chartValues}
             onChange={handleAxisChange}
           />
-          <div className={styles.dimensionControl}>
-            <label className={styles.dimensionLabel}>
-              Dimensions: {visibleCount}
-            </label>
-            <input
-              type="range"
-              className={styles.dimensionSlider}
-              min={4}
-              max={components.length}
-              value={visibleCount}
-              onChange={(e) => setDisplayCount(Number(e.target.value))}
-            />
-          </div>
+          {!isSemantic && !isStyle && (
+            <div className={styles.dimensionControl}>
+              <label className={styles.dimensionLabel}>
+                Dimensions: {visibleCount}
+              </label>
+              <input
+                type="range"
+                className={styles.dimensionSlider}
+                min={4}
+                max={components.length}
+                value={visibleCount}
+                onChange={(e) => setDisplayCount(Number(e.target.value))}
+              />
+            </div>
+          )}
         </div>
 
         <div className={styles.controlsPanel}>

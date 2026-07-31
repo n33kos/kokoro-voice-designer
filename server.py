@@ -49,6 +49,8 @@ VOICES_DIR = PROJECT_ROOT / "voices"
 CATALOG_DIR = PROJECT_ROOT / "catalog"
 DEFAULT_CATALOG = CATALOG_DIR / "discovery_catalog.pt"
 COMPONENT_LABELS_FILE = CATALOG_DIR / "component_labels.json"
+SEMANTIC_MAP_FILE = CATALOG_DIR / "semantic_map.json"
+STYLE_MAP_FILE = CATALOG_DIR / "style_map.json"
 
 FEATURE_LABELS = {
     "pitch_mean": "pitch",
@@ -96,6 +98,33 @@ all_components: torch.Tensor | None = None
 component_ranges: torch.Tensor | None = None
 pca_mean: torch.Tensor | None = None
 voice_shape: tuple | None = None
+semantic_features: list[dict] | None = None
+semantic_directions: list[list[float]] | None = None
+has_semantic_map: bool = False
+
+# Style map (v2): directions live in Kokoro's native 256-dim style space rather
+# than in PCA/discovery component space. See build_style_map.py.
+style_feature_names: list[str] | None = None
+style_directions: torch.Tensor | None = None
+has_style_map: bool = False
+
+
+def apply_style_deltas(base_voice: torch.Tensor, coeffs: list[float]) -> torch.Tensor:
+    """Apply semantic slider values as offsets in 256-dim style space.
+
+    A voice file is [510, 1, 256] — 510 style vectors indexed by phoneme count.
+    The offset is applied uniformly to every row so a slider means the same
+    thing regardless of how long the utterance is.
+    """
+    if style_directions is None:
+        return base_voice
+    n = min(len(coeffs), style_directions.shape[0])
+    c = torch.tensor(coeffs[:n], dtype=torch.float32)
+    delta = (c.unsqueeze(0) @ style_directions[:n]).squeeze(0)  # [256]
+
+    rows = base_voice.shape[0]
+    out = base_voice.reshape(rows, 256).float() + delta.unsqueeze(0)
+    return out.reshape(base_voice.shape)
 
 
 def load_voice(path: str | Path) -> torch.Tensor:
@@ -279,6 +308,36 @@ async def startup():
     else:
         component_names = _default_component_names(pca_comps.shape[0], component_count)
 
+    # Load semantic map if available
+    global semantic_features, semantic_directions, has_semantic_map
+    if SEMANTIC_MAP_FILE.exists():
+        try:
+            with open(SEMANTIC_MAP_FILE, "r") as f:
+                sem_map = json.load(f)
+            semantic_features = [
+                {"name": name, "index": i}
+                for i, name in enumerate(sem_map["feature_names"])
+            ]
+            semantic_directions = sem_map["directions"]
+            has_semantic_map = True
+            print(f"[server] Loaded semantic map: {len(semantic_features)} features")
+        except Exception as e:
+            print(f"[server] Could not load semantic map ({e})")
+
+    # Load style map (v2) if available
+    global style_feature_names, style_directions, has_style_map
+    if STYLE_MAP_FILE.exists():
+        try:
+            with open(STYLE_MAP_FILE, "r") as f:
+                smap = json.load(f)
+            style_feature_names = smap["feature_names"]
+            style_directions = torch.tensor(smap["directions"], dtype=torch.float32)
+            has_style_map = True
+            print(f"[server] Loaded style map: {len(style_feature_names)} features "
+                  f"in {style_directions.shape[1]}-dim style space")
+        except Exception as e:
+            print(f"[server] Could not load style map ({e})")
+
     print(f"[server] Ready. {component_count} components: {', '.join(component_names[:10])}...")
 
 
@@ -290,6 +349,9 @@ class SynthesizeRequest(BaseModel):
     coefficients: list[float]  # one per component, range [-1, 1]
     text: str
     speed: float = 1.0
+    # When present, sliders are applied in 256-dim style space (style map v2)
+    # instead of component space, and `coefficients` is ignored.
+    styleCoefficients: list[float] | None = None
 
 
 class ExportVoiceRequest(BaseModel):
@@ -314,14 +376,26 @@ async def list_voices():
 
 @app.get("/api/catalog")
 async def get_catalog():
-    return {
+    result: dict = {
         "components": [
             {"index": i, "name": component_names[i]}
             for i in range(component_count)
         ],
         "count": component_count,
         "pcaCount": pca_count,
+        "hasSemanticMap": has_semantic_map,
     }
+    if has_semantic_map and semantic_features is not None and semantic_directions is not None:
+        result["semanticFeatures"] = semantic_features
+        result["semanticDirections"] = semantic_directions
+    result["hasStyleMap"] = has_style_map
+    if has_style_map and style_feature_names is not None:
+        # Directions stay server-side: the client only sends slider values, and
+        # the 256-dim offsets are applied during synthesis.
+        result["styleFeatures"] = [
+            {"index": i, "name": n} for i, n in enumerate(style_feature_names)
+        ]
+    return result
 
 
 @app.post("/api/export-voice")
@@ -419,15 +493,18 @@ async def synthesize(req: SynthesizeRequest):
 
     base_voice = load_voice(voice_path)
 
-    # Build coefficient tensor
-    coeffs = torch.zeros(component_count)
-    for i, c in enumerate(req.coefficients[:component_count]):
-        coeffs[i] = c
+    if req.styleCoefficients is not None and has_style_map:
+        voice_flat = apply_style_deltas(base_voice, req.styleCoefficients).reshape(-1)
+    else:
+        # Build coefficient tensor
+        coeffs = torch.zeros(component_count)
+        for i, c in enumerate(req.coefficients[:component_count]):
+            coeffs[i] = c
 
-    # Apply: voice = base + sum(coeff * range * component)
-    scaled = coeffs * component_ranges
-    perturbation = (scaled.unsqueeze(0) @ all_components).squeeze(0)
-    voice_flat = base_voice.reshape(-1).float() + perturbation
+        # Apply: voice = base + sum(coeff * range * component)
+        scaled = coeffs * component_ranges
+        perturbation = (scaled.unsqueeze(0) @ all_components).squeeze(0)
+        voice_flat = base_voice.reshape(-1).float() + perturbation
 
     # Clamp
     base_flat = base_voice.reshape(-1).float()
