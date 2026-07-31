@@ -15,8 +15,8 @@ Two figures to keep in mind when reading the output:
     built-in-voice sanity check produces.
 
 Usage:
-    uv run python evaluate_match.py --reference "input/Kate Reading.wav" \
-        --candidates voices/af_heart.pt voices/af_kate_reading.pt output/match_kate.pt
+    uv run python evaluate_match.py --reference input/reference.wav \
+        --candidates voices/af_heart.pt output/my_voice.pt
 """
 
 import argparse

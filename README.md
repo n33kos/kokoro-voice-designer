@@ -1,8 +1,8 @@
 # Voice Designer
 
-Design synthetic voices for [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) — either by hand, with calibrated sliders for pitch, pace, brightness and warmth, or automatically, by solving for a voice with gradient descent.
+Design synthetic voices for [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) — either by hand, with calibrated sliders for pitch, pace, brightness and warmth, or automatically, by fitting a voice to a reference recording with gradient descent.
 
-**This tool is for creating voices, not for impersonating people.** See [Intended use](#intended-use).
+Please read [Acceptable Use](#acceptable-use) before using the reference-fitting workflow.
 
 ---
 
@@ -85,9 +85,11 @@ That synthesizes with each slider at 1.0 on held-out text and reports what actua
 
 ---
 
-## Matching a voice from a recording
+## Fitting a voice to a reference recording
 
-`invert_voice.py` solves for a voice by gradient descent. Kokoro's 82M weights stay frozen; the only things optimized are a few hundred numbers describing one voice. This is the inverse of training, using the same machinery.
+`invert_voice.py` solves for a voice by gradient descent against a reference recording. Kokoro's 82M weights stay frozen; the only things optimized are a few hundred numbers describing one voice. This is the inverse of training, using the same machinery.
+
+This produces a voice that resembles the reference. Only use audio you own or have documented permission to use — see [Acceptable Use](#acceptable-use).
 
 **You need a recording plus its transcript.** The transcript matters more than you'd expect — see [why](#why-the-transcript-matters).
 
@@ -164,7 +166,7 @@ Scores candidates on held-out text and writes samples for listening.
 
 An older, separate line of work, still used by `auto_mode.py`. PCA over Kokoro's built-in voices finds the axes of greatest variation; discovery probes random directions orthogonal to PCA to find impactful dimensions the voice library doesn't vary along. `build_catalog.py` distills the results.
 
-This powers `auto_mode.py`, a coordinate-descent optimizer that predates the gradient-based approach. Gradient inversion is substantially better — on two real references it beat auto mode by 0.19 and 0.11 Resemblyzer similarity — so prefer `invert_voice.py` for voice matching. Discovery remains interesting for exploring directions outside the built-in voice distribution.
+This powers `auto_mode.py`, a coordinate-descent optimizer that predates the gradient-based approach. It fits a voice to a reference recording the same way `invert_voice.py` does, but by black-box search rather than gradients, and it converges to a noticeably worse result for far more compute. Prefer `invert_voice.py`. Discovery remains useful for exploring directions outside the built-in voice distribution.
 
 ### The catalog and Git LFS
 
@@ -235,14 +237,32 @@ Since this depends on Kokoro internals rather than a public API, `test_different
 
 ---
 
-## Intended use
+## Acceptable Use
 
-This project exists to help people **create** voices: to sculpt an original synthetic voice, shape one toward a character, or give someone who needs a synthetic voice a way to make one that feels like their own.
+The code is MIT licensed (see [LICENSE](LICENSE)). This section is separate from the license and is not a legal restriction — use-restricted licenses aren't open source and are largely unenforceable anyway. It's how the project asks to be used.
 
-**It is not intended for impersonating real people.** Please don't use it to reproduce someone's voice without their informed consent, to produce speech that could be mistaken for a real person's recorded words, to defeat voice authentication, or to generate audio that harasses or defames anyone.
+### Only fit against audio you own or have permission to use
 
-If you're matching against a reference, the standard is simple: your own voice, a voice you have explicit permission to use, or a synthetic or public-domain source. "I found it online" is not permission.
+The reference-fitting workflow produces a voice that resembles whoever is in the recording. Use your own voice, audio you have documented permission to use, or public-domain or synthetic sources. Finding audio online is not permission, and neither is owning a copy of a recording — buying an audiobook doesn't license the narrator's voice.
 
-Voice is personal, and for many people — narrators, voice actors, broadcasters — it is also their livelihood. Please build things you'd be comfortable having done to your own voice.
+If you want reference material for testing, the datasets built for speech research are a better fit than anything scraped: [VCTK](https://datashare.ed.ac.uk/handle/10283/3443), [Common Voice](https://commonvoice.mozilla.org/), [LibriSpeech](https://www.openslr.org/12), and [LJSpeech](https://keithito.com/LJ-Speech-Dataset/). They're consented, cleanly recorded, and give you many clips per speaker at varying lengths, which is what the multi-clip workflow wants.
 
-See [LICENSE](LICENSE) for the full terms (MIT) and this statement in full.
+### Publishing a voice file is permanent
+
+A `.pt` voice file is not a recording — it's the ability to generate unlimited speech in that voice, for anyone who has a copy, indefinitely. You cannot un-publish it. Deleting the repo doesn't retract the copies.
+
+**This applies to your own voice too.** Publishing a voice fitted to yourself hands everyone who downloads it the ability to make you say anything, permanently. That may still be a fine trade for you — just make it deliberately.
+
+### Don't publish voices that imitate real identifiable people
+
+Fitting a voice to a reference for your own use is one thing. Publishing or distributing a voice file that reproduces a real, identifiable person's voice is another, and this project asks you not to do it. That includes public figures, and it especially includes people whose voice is their livelihood — narrators, voice actors, broadcasters, performers.
+
+If you publish voices made with this tool, say how they were made and what they were fitted to.
+
+### Legal context
+
+Not legal advice, and this is a fast-moving area. Tennessee's ELVIS Act, California's digital replica statutes, and the EU AI Act's disclosure duties for synthetic media all exist and all broadly target **whoever deploys or distributes a voice replica**, rather than whoever wrote the software. If you publish a voice or the audio it generates, that's you. Worth understanding what applies where you are before you publish.
+
+### Roadmap: watermarking
+
+Output watermarking is under consideration — likely [AudioSeal](https://github.com/facebookresearch/audioseal) or [Resemble Perth](https://github.com/resemble-ai/perth), both open source and both designed to survive ordinary audio processing. It would mark generated audio as synthetic and make provenance checkable, which is a better position than relying on good intentions. Not implemented yet.

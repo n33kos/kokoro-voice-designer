@@ -22,34 +22,7 @@ SOFTWARE.
 
 ---
 
-NOTE ON INTENDED USE
-
-The MIT terms above are the legal license. What follows is not an additional
-legal restriction — it is the authors' statement of what this project is for,
-and what it asks of the people who use it.
-
-Voice Designer exists to help people CREATE voices: to sculpt an original
-synthetic voice, to shape one toward a character or a feeling, and to give
-people who need a synthetic voice a way to make one that feels like their own.
-
-It is NOT intended for impersonating real people.
-
-Concretely, please do not use this project to:
-
-  - Reproduce the voice of a real person without their clear, informed consent.
-  - Make synthetic speech that could be mistaken for a real person's recorded
-    words — especially public figures, or anyone whose voice is their livelihood
-    (narrators, voice actors, broadcasters, performers).
-  - Defeat voice-based authentication, or produce material intended to deceive
-    a listener about who is speaking.
-  - Generate audio that harasses, defames, or sexualizes any real person.
-
-If you are matching against a reference recording, the reasonable standard is
-simple: it should be your own voice, a voice you have explicit permission to
-use, or a synthetic or public-domain source. "I found it online" is not
-permission.
-
-Voice is personal, and for many people it is also their profession. Cloning
-someone's voice without consent takes something from them that they cannot get
-back. Please build things you would be comfortable having done to your own
-voice.
+The code license above is unmodified MIT. See the "Acceptable Use" section of
+the README for how the project asks that it be used — kept separate from the
+license deliberately, since use-restricted licenses are not open source and are
+largely unenforceable in practice.

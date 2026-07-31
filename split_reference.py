@@ -27,8 +27,8 @@ it should be tight and plausible, so a wild rate means the transcript doesn't
 match the audio and the clips must not be trained on.
 
 Usage:
-    uv run python split_reference.py --audio input/MichaelKramer.wav \
-        --whisper --out-dir input/michael_split
+    uv run python split_reference.py --audio input/long_recording.wav \
+        --whisper --out-dir input/split
 """
 
 import argparse
