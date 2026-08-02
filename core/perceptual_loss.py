@@ -200,9 +200,76 @@ def f0_reference_distribution(audio: np.ndarray, sr: int = KOKORO_SR,
     return [float(q) for q in np.quantile(np.log(voiced), F0_DENSE_QUANTILES)]
 
 
+def voiced_threshold_for(target: list[float], factor: float = 0.28) -> float:
+    """Voicing cut scaled to the speaker, in Hz.
+
+    A fixed 30 Hz cut is 0.39x the register of a low voice but only 0.24x that of
+    a higher one, so it admits far more sub-register junk the higher the speaker.
+    Measured: 2% of counted frames sat below 0.6x register for a 77 Hz voice
+    against 21% for a 126 Hz voice — and the loss then faithfully matched
+    statistics computed over that junk, which is audible as excess creak.
+
+    Kept deliberately low (~0.28x register). A higher cut removes creak frames
+    from the distribution match, which stops constraining them rather than
+    fixing them — see `creak_fraction_loss`, which targets their quantity
+    instead. This cut exists only to drop unvoiced frames near 0 Hz.
+
+    Keyed to the target's *median*, not its low tail — the low tail of the
+    reference is itself partly creak, so scaling from it reproduces the problem.
+    Half the median is roughly an octave down, below which a frame is far more
+    likely to be sub-harmonic error than speech.
+    """
+    if not target:
+        return 30.0
+    median = np.exp(target[len(target) // 2])
+    return float(median * factor)
+
+
+def creak_reference_fraction(audio: np.ndarray, sr: int = KOKORO_SR,
+                             band: tuple[float, float] | None = None,
+                             factor: float = 0.6) -> tuple[float, float]:
+    """How much of a reference sits below `factor` x its own register.
+
+    Returns (fraction, threshold_hz). Real speech contains some creak — measured
+    5-12% across three references — so the target is to *match* that amount, not
+    to eliminate it.
+    """
+    import librosa
+
+    lo, hi = band if band is not None else estimate_pitch_range(audio, sr)
+    f0 = librosa.yin(audio, fmin=lo, fmax=hi, sr=sr)
+    voiced = f0[(f0 > lo * 1.02) & (f0 < hi * 0.98)]
+    if len(voiced) < 20:
+        return 0.0, 0.0
+    threshold = float(np.median(voiced) * factor)
+    return float(np.mean(voiced < threshold)), threshold
+
+
+def creak_fraction_loss(f0_pred: torch.Tensor, target_fraction: float,
+                        threshold_hz: float, floor_hz: float = 20.0,
+                        sharpness: float = 0.15) -> torch.Tensor:
+    """Match the proportion of frames sitting below the creak threshold.
+
+    Added because raising the voicing cut to exclude sub-register frames from the
+    distribution match stopped *penalising* them: excluded frames are
+    unconstrained, and the low-frame share rose from 5% to 14% (Michael) and 12%
+    to 22% (Kate) once they were no longer measured. Constraining the share
+    directly is the correction — the frames stay visible to the loss and their
+    quantity is targeted.
+
+    A sigmoid rather than a hard count, so it is differentiable.
+    """
+    f0 = f0_pred.squeeze()
+    speech = f0[f0 > floor_hz]
+    if speech.numel() < 8:
+        return f0.sum() * 0.0
+    below = torch.sigmoid((threshold_hz - speech) * sharpness)
+    return (below.mean() - target_fraction) ** 2
+
+
 def f0_distribution_loss(f0_pred: torch.Tensor, target: list[float],
                          offset: list[float] | None = None,
-                         voiced_threshold: float = 30.0) -> torch.Tensor:
+                         voiced_threshold: float | None = None) -> torch.Tensor:
     """Match the whole log-F0 distribution, not five points on it.
 
     Equivalent to a quantile-function (inverse-CDF) distance: comparing sorted
@@ -214,6 +281,8 @@ def f0_distribution_loss(f0_pred: torch.Tensor, target: list[float],
     shift — measured 0.68x at the bottom of the distribution and 1.09x at the
     top — so it must be applied per level.
     """
+    if voiced_threshold is None:
+        voiced_threshold = voiced_threshold_for(target)
     f0 = f0_pred.squeeze()
     voiced = f0[f0 > voiced_threshold]
     if voiced.numel() < 8:

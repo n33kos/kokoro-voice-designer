@@ -52,7 +52,10 @@ from core.perceptual_loss import (
     energy_dynamics_loss,
     energy_reference_cv,
     estimate_pitch_range,
+    creak_fraction_loss,
+    creak_reference_fraction,
     f0_distribution_loss,
+    voiced_threshold_for,
     f0_reference_distribution,
     pacing_loss,
     speaking_rate,
@@ -251,6 +254,8 @@ def invert(
     f0_target: list[float] | None = None,
     pitch_band: tuple[float, float] = (50.0, 400.0),
     f0_weight: float = 0.0,
+    creak_target: tuple[float, float] | None = None,
+    creak_weight: float = 0.0,
     energy_target: float | None = None,
     energy_weight: float = 0.0,
     duration_weight: float = 0.0,
@@ -304,6 +309,9 @@ def invert(
     # 1.06 by the end of a run, so the loss reported success while the rendered
     # pitch sat 6% sharp. Re-measuring periodically closes that loop.
     f0_offset = [0.0] * len(F0_DENSE_QUANTILES)
+    # Same cut for the loss and its calibration, or the two measure different
+    # subsets of frames and the correction is meaningless.
+    voiced_cut = voiced_threshold_for(f0_target) if f0_target else 30.0
 
     def recalibrate(f0_target):
         """Shift the F0 target so rendered pitch, not F0_pred, hits the mark.
@@ -322,7 +330,7 @@ def invert(
             with torch.no_grad():
                 out = diff.forward(ctx, params.row(len(ps)))
             f0 = out.f0_pred.squeeze()
-            v = f0[f0 > 30.0]
+            v = f0[f0 > voiced_cut]
             if v.numel() < 8:
                 continue
             internal = np.quantile(np.log(v.detach().cpu().numpy()), F0_DENSE_QUANTILES)
@@ -350,7 +358,7 @@ def invert(
         # the shared objective. Accumulating over all texts makes each step a
         # genuine descent direction.
         opt.zero_grad()
-        totals = {"perceptual": 0.0, "pacing": 0.0, "speaker": 0.0, "f0": 0.0, "energy": 0.0, "dur": 0.0}
+        totals = {"perceptual": 0.0, "pacing": 0.0, "speaker": 0.0, "f0": 0.0, "creak": 0.0, "energy": 0.0, "dur": 0.0}
         total_loss = 0.0
 
         for text, ps, ctx in contexts:
@@ -396,6 +404,11 @@ def invert(
                 lf = f0_distribution_loss(out.f0_pred, f0_target, offset=f0_offset)
                 loss = loss + f0_weight * lf
                 totals["f0"] += float(lf)
+
+            if creak_target is not None and creak_weight > 0:
+                lc = creak_fraction_loss(out.f0_pred, creak_target[0], creak_target[1])
+                loss = loss + creak_weight * lc
+                totals["creak"] += float(lc)
 
             if energy_target is not None and energy_weight > 0:
                 le = energy_dynamics_loss(out.n_pred, energy_target)
@@ -470,6 +483,9 @@ def main() -> int:
     # Was 0.1 against a pitch weight of 5.0, i.e. fifty times weaker, which left
     # speaking rate effectively unconstrained.
     ap.add_argument("--pacing-weight", type=float, default=2.0)
+    ap.add_argument("--creak-weight", type=float, default=0.0,
+                    help="Weight on matching how much of the voice sits in creak "
+                         "below the register")
     ap.add_argument("--energy-weight", type=float, default=0.0,
                     help="Weight on matching how much loudness varies")
     ap.add_argument("--speaker-weight", type=float, default=0.0,
@@ -664,9 +680,18 @@ def main() -> int:
         log(f"Pitch analysis band from reference: "
             f"{pitch_band[0]:.0f}-{pitch_band[1]:.0f} Hz")
         f0_target = f0_reference_distribution(ref, band=pitch_band)
+        log(f"Voiced cut: {voiced_threshold_for(f0_target):.0f} Hz "
+            f"(scaled to this speaker)")
         log(f"F0 target: {len(f0_target)}-level distribution, "
             + " ".join(f"{np.exp(f0_target[i]):.0f}" for i in (0, 6, 12, 18, 24))
             + " Hz at p2/p26/p50/p74/p98")
+
+    creak_target = None
+    if args.creak_weight > 0 and args.f0_reference:
+        ref_c, _ = librosa.load(args.f0_reference, sr=KOKORO_SR, mono=True)
+        creak_target = creak_reference_fraction(ref_c, band=pitch_band)
+        log(f"Creak target: {100*creak_target[0]:.0f}% of frames below "
+            f"{creak_target[1]:.0f} Hz")
 
     energy_target = None
     if args.energy_weight > 0:
@@ -710,6 +735,8 @@ def main() -> int:
         f0_target=f0_target,
         f0_weight=args.f0_weight,
         pitch_band=pitch_band,
+        creak_target=creak_target,
+        creak_weight=args.creak_weight,
         energy_target=energy_target,
         energy_weight=args.energy_weight,
         duration_weight=args.duration_weight,
