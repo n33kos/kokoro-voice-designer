@@ -120,6 +120,142 @@ class WavLMPooledLoss(torch.nn.Module):
         return F.mse_loss(self.pooled_stats(generated_24k), target_stats)
 
 
+def estimate_pitch_range(audio: np.ndarray, sr: int = KOKORO_SR) -> tuple[float, float]:
+    """Derive a pitch-analysis band centred on the speaker's own register.
+
+    A fixed 50-400 Hz band silently clips anyone outside it, biasing every
+    quantile downstream. But simply widening it is worse, not better: a 40-600 Hz
+    band lets yin make octave errors, which land in the tails where the quantiles
+    live. Measured on one reference, widening moved the 90th percentile from a
+    correct 160 Hz to 520 Hz — the narrow band had been suppressing octave errors
+    as much as it had been clipping.
+
+    So estimate the register first, with a median (robust to exactly those tail
+    errors), then bracket it by a factor covering the range a speaker actually
+    uses. The result adapts to the voice while keeping a prior tight enough to
+    reject octave confusion.
+
+    The returned band must be reused for *every* comparison in a run. Measuring a
+    reference and a generated clip through different bands makes the two numbers
+    incomparable.
+    """
+    import librosa
+
+    coarse = librosa.yin(audio, fmin=40.0, fmax=600.0, sr=sr)
+    voiced = coarse[(coarse > 42) & (coarse < 580)]
+    if len(voiced) < 20:
+        return 50.0, 400.0
+    register = float(np.median(voiced))
+    return max(40.0, register / 2.5), min(700.0, register * 2.5)
+
+
+# Quantiles pinned by the pitch loss. The middle one fixes the speaker's register;
+# the outer ones fix how far the voice travels above and below it, separately.
+F0_QUANTILES = (0.10, 0.25, 0.50, 0.75, 0.90)
+
+
+def f0_reference_quantiles(audio: np.ndarray, sr: int = KOKORO_SR,
+                           band: tuple[float, float] | None = None) -> list[float]:
+    """Log-F0 quantiles of a reference recording — the pitch-loss target.
+
+    Replaces matching mean and standard deviation, which cannot represent these
+    distributions. Speech pitch is skewed, and the direction differs per speaker:
+    one measured voice sits at a 78.6 Hz register and rises to 160 for emphasis
+    (2.04x up, 1.23x down), while another sits at 159 Hz and dips *down* instead
+    (1.22x up, 1.96x down). A symmetric spread around a mean describes neither,
+    and the mean itself sits well above the register a listener hears — 96.3 Hz
+    against a 78.6 Hz mode for the first voice.
+
+    Quantiles capture register and asymmetry together, and unlike a modal
+    estimate they have a differentiable counterpart in torch.
+    """
+    import librosa
+
+    lo, hi = band if band is not None else estimate_pitch_range(audio, sr)
+    f0 = librosa.yin(audio, fmin=lo, fmax=hi, sr=sr)
+    voiced = f0[(f0 > lo * 1.02) & (f0 < hi * 0.98)]
+    if len(voiced) == 0:
+        return [0.0] * len(F0_QUANTILES)
+    return [float(q) for q in np.quantile(np.log(voiced), F0_QUANTILES)]
+
+
+# Quantile levels for distribution matching. Dense enough that the *shape*
+# between landmarks is constrained, not just the landmarks: with five levels a
+# match had near-perfect quantiles while its density was bimodal with a hole in
+# the middle — a third of frames piled into vocal fry below the register and a
+# bulge above it, audible as thin and croaky.
+F0_DENSE_QUANTILES = tuple(round(0.02 + 0.96 * i / 24, 4) for i in range(25))
+
+
+def f0_reference_distribution(audio: np.ndarray, sr: int = KOKORO_SR,
+                              band: tuple[float, float] | None = None) -> list[float]:
+    """Densely sampled log-F0 quantiles — the distribution-matching target."""
+    import librosa
+
+    lo, hi = band if band is not None else estimate_pitch_range(audio, sr)
+    f0 = librosa.yin(audio, fmin=lo, fmax=hi, sr=sr)
+    voiced = f0[(f0 > lo * 1.02) & (f0 < hi * 0.98)]
+    if len(voiced) == 0:
+        return [0.0] * len(F0_DENSE_QUANTILES)
+    return [float(q) for q in np.quantile(np.log(voiced), F0_DENSE_QUANTILES)]
+
+
+def f0_distribution_loss(f0_pred: torch.Tensor, target: list[float],
+                         offset: list[float] | None = None,
+                         voiced_threshold: float = 30.0) -> torch.Tensor:
+    """Match the whole log-F0 distribution, not five points on it.
+
+    Equivalent to a quantile-function (inverse-CDF) distance: comparing sorted
+    distributions at many levels constrains density everywhere, so the optimizer
+    cannot satisfy the landmarks while leaving a gap between them.
+
+    `offset` is a per-level correction for the gap between Kokoro's internal
+    F0_pred and pitch measured on rendered audio. That gap is a stretch, not a
+    shift — measured 0.68x at the bottom of the distribution and 1.09x at the
+    top — so it must be applied per level.
+    """
+    f0 = f0_pred.squeeze()
+    voiced = f0[f0 > voiced_threshold]
+    if voiced.numel() < 8:
+        return f0.sum() * 0.0
+    log_f0 = torch.log(voiced.clamp(min=1.0))
+    qs = torch.tensor(F0_DENSE_QUANTILES, device=f0.device, dtype=log_f0.dtype)
+    got = torch.quantile(log_f0, qs)
+    want = torch.tensor(target, device=f0.device, dtype=log_f0.dtype)
+    if offset is not None:
+        want = want + torch.tensor(offset, device=f0.device, dtype=log_f0.dtype)
+    return ((got - want) ** 2).mean()
+
+
+def f0_quantile_loss(f0_pred: torch.Tensor, target: list[float],
+                     offset: float | list[float] = 0.0,
+                     voiced_threshold: float = 30.0,
+                     sharpness: float = 0.2) -> torch.Tensor:
+    """Match the log-F0 quantiles of `F0_pred` to a reference.
+
+    `offset` shifts the whole target to compensate for the gap between Kokoro's
+    internal F0_pred and the pitch measured on rendered audio, which varies by
+    voice and drifts during training.
+
+    Unvoiced frames sit near 0 Hz and would dominate the low quantiles, so they
+    are dropped by a hard threshold here rather than the soft mask used for
+    moments — quantiles need an actual subset, and the threshold is far from any
+    real pitch so no gradient signal is lost.
+    """
+    f0 = f0_pred.squeeze()
+    voiced = f0[f0 > voiced_threshold]
+    if voiced.numel() < 8:
+        return f0.sum() * 0.0
+    log_f0 = torch.log(voiced.clamp(min=1.0))
+    qs = torch.tensor(F0_QUANTILES, device=f0.device, dtype=log_f0.dtype)
+    got = torch.quantile(log_f0, qs)
+    want = torch.tensor(target, device=f0.device, dtype=log_f0.dtype)
+    off = torch.tensor(offset if isinstance(offset, (list, tuple)) else [offset] * len(target),
+                       device=f0.device, dtype=log_f0.dtype)
+    want = want + off
+    return ((got - want) ** 2).mean()
+
+
 def f0_reference_stats(audio: np.ndarray, sr: int = KOKORO_SR) -> tuple[float, float]:
     """Median and spread of log-F0 in a reference recording.
 
@@ -160,6 +296,39 @@ def f0_stats_loss(f0_pred: torch.Tensor, target_mean: float, target_std: float,
     std = var.clamp(min=1e-8).sqrt()
 
     return (mean - target_mean) ** 2 + (std - target_std) ** 2
+
+
+def energy_reference_cv(audio: np.ndarray, sr: int = KOKORO_SR) -> float:
+    """Coefficient of variation of frame energy in a reference recording.
+
+    Deliberately dimensionless. Kokoro's `N_pred` is an internal energy contour
+    on no particular scale, so matching its absolute level against a waveform
+    measurement would repeat the units mismatch that made the pitch loss report
+    success while sounding wrong. A ratio of spread to mean is comparable across
+    both domains.
+    """
+    import librosa
+
+    rms = librosa.feature.rms(y=audio)[0]
+    rms = rms[rms > np.percentile(rms, 10)]      # drop silence
+    if len(rms) < 10 or float(rms.mean()) <= 0:
+        return 0.0
+    return float(rms.std() / rms.mean())
+
+
+def energy_dynamics_loss(n_pred: torch.Tensor, target_cv: float) -> torch.Tensor:
+    """Match how much the voice's loudness moves, relative to its own level.
+
+    Energy variation is one of the twelve style dimensions but was only
+    constrained indirectly, through the WavLM term. Unconstrained dimensions
+    have been where every audible regression came from.
+    """
+    n = n_pred.squeeze()
+    n = n[n > n.abs().mean() * 0.1]              # ignore near-silent frames
+    if n.numel() < 10:
+        return n_pred.sum() * 0.0
+    cv = n.std() / n.mean().abs().clamp(min=1e-6)
+    return (cv - target_cv) ** 2
 
 
 def duration_floor_loss(duration: torch.Tensor, phoneme_mask: torch.Tensor,

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """FastAPI backend for the Kokoro Voice Designer web UI.
 
-Serves voice synthesis API, catalog/component data, and voice file listings.
+Serves voice synthesis, the style-slider definitions, and voice file listings.
 
 Usage:
     uv run uvicorn server:app --reload --port 8000
@@ -39,7 +39,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-from core import SpeechGenerator, VoiceAnalyzer, FitnessScorer
+from core import SpeechGenerator
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -47,32 +47,7 @@ from core import SpeechGenerator, VoiceAnalyzer, FitnessScorer
 PROJECT_ROOT = Path(__file__).parent
 VOICES_DIR = PROJECT_ROOT / "voices"
 CATALOG_DIR = PROJECT_ROOT / "catalog"
-DEFAULT_CATALOG = CATALOG_DIR / "discovery_catalog.pt"
-COMPONENT_LABELS_FILE = CATALOG_DIR / "component_labels.json"
 STYLE_MAP_FILE = CATALOG_DIR / "style_map.json"
-
-FEATURE_LABELS = {
-    "pitch_mean": "pitch",
-    "pitch_std": "pitch variation",
-    "spectral_centroid_mean": "brightness",
-    "spectral_bandwidth_mean": "fullness",
-    "spectral_rolloff_mean": "crispness",
-    "spectral_contrast_mean": "clarity",
-    "spectral_flatness_mean": "breathiness",
-    "rms_energy": "volume",
-    "energy_mean": "energy",
-    "energy_std": "energy variation",
-    "mfcc1_mean": "timbre",
-    "mfcc2_mean": "nasality",
-    "mfcc3_mean": "resonance",
-    "mfcc4_mean": "texture",
-    "chroma_mean": "harmonics",
-    "tonnetz_mean": "tonality",
-    "tempo": "pace",
-    "audio_std": "dynamics",
-    "harmonic_ratio": "harmonic richness",
-    "zero_crossing_rate": "sibilance",
-}
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -89,16 +64,7 @@ app.add_middleware(
 # Global state (initialized on startup)
 # ---------------------------------------------------------------------------
 speech_gen: SpeechGenerator | None = None
-catalog_data: dict | None = None
-component_names: list[str] = []
-component_count: int = 0
-pca_count: int = 0
-all_components: torch.Tensor | None = None
-component_ranges: torch.Tensor | None = None
-pca_mean: torch.Tensor | None = None
-voice_shape: tuple | None = None
-# Style map (v2): directions live in Kokoro's native 256-dim style space rather
-# than in PCA/discovery component space. See build_style_map.py.
+# Named style axes in Kokoro's 256-dim style space. See build_style_map.py.
 style_feature_names: list[str] | None = None
 style_directions: torch.Tensor | None = None
 has_style_map: bool = False
@@ -129,31 +95,13 @@ def load_voice(path: str | Path) -> torch.Tensor:
         return torch.load(path, weights_only=False)
 
 
-def _default_component_names(n_pca_count: int, total: int) -> list[str]:
-    """Fallback label assignment: cycle through FEATURE_LABELS for all components."""
-    label_list = list(FEATURE_LABELS.values())
-    name_counts: dict[str, int] = {}
-    names = []
-    for i in range(total):
-        base_name = label_list[i % len(label_list)] if label_list else f"d{i}"
-        count = name_counts.get(base_name, 0) + 1
-        name_counts[base_name] = count
-        if count > 1:
-            names.append(f"{base_name} {count}")
-        else:
-            names.append(base_name)
-    return names
-
-
 @app.on_event("startup")
 async def startup():
-    global speech_gen, catalog_data, component_names, component_count, pca_count
-    global all_components, component_ranges, pca_mean, voice_shape
+    global speech_gen
 
     print("[server] Initializing Kokoro pipeline...")
     speech_gen = SpeechGenerator()
 
-    # Style map is small and always needed; the component catalog is not.
     # Load style map (v2) if available
     global style_feature_names, style_directions, has_style_map
     if STYLE_MAP_FILE.exists():
@@ -168,139 +116,24 @@ async def startup():
         except Exception as e:
             print(f"[server] Could not load style map ({e})")
 
-    print(f"[server] Ready. {component_count} components: {', '.join(component_names[:10])}...")
+    print("[server] Ready.")
 
 
 
-
-def ensure_components_loaded() -> bool:
-    """Load the PCA/discovery component space on first use.
-
-    The catalog is ~530MB and takes tens of seconds to load, but nothing in the
-    web UI needs it — the style sliders operate directly on Kokoro's 256-dim
-    style space. Only the legacy raw-coefficient API path uses components, so
-    this defers the cost to a request that actually needs it. Most servers never
-    pay it at all.
-    """
-    global catalog_data, component_names, component_count, pca_count
-    global all_components, component_ranges, pca_mean, voice_shape
-
-    if all_components is not None:
-        return True
-    try:
-        print("[server] Loading component catalog (first raw-coefficient request)...")
-        # Load voices for PCA / ranges
-        pt_files = sorted(f for f in os.listdir(VOICES_DIR) if f.endswith(".pt"))
-        voice_tensors = [load_voice(VOICES_DIR / f) for f in pt_files]
-        voice_shape_val = voice_tensors[0].shape
-        voice_shape = voice_shape_val
-        n_voices = len(voice_tensors)
-
-        # Load catalog or compute PCA
-        catalog = None
-        if DEFAULT_CATALOG.exists():
-            try:
-                catalog = torch.load(DEFAULT_CATALOG, weights_only=False)
-                print(f"[server] Loaded catalog: {catalog.get('pca_n_components', 0)} PCA + "
-                      f"{len(catalog.get('discovered_impacts', []))} discoveries")
-            except Exception as e:
-                print(f"[server] Could not load catalog: {e}")
-
-        if catalog is not None:
-            n_pca = catalog.get("pca_n_components", 0)
-            pca_comps = catalog["pca_components"][:n_pca]
-            pca_sv = catalog["pca_singular_values"][:n_pca]
-            pca_mean = catalog["pca_mean"]
-            analyzer_mean = pca_mean
-
-            # Discovery components
-            disc_comps = catalog.get("discovered_components")
-            if disc_comps is not None and disc_comps.shape[0] > 0:
-                avg_sv = float(pca_sv.mean())
-                disc_sv = torch.full((disc_comps.shape[0],), avg_sv)
-                all_comps_parts = [pca_comps, disc_comps]
-                all_sv_parts = [pca_sv, disc_sv]
-            else:
-                all_comps_parts = [pca_comps]
-                all_sv_parts = [pca_sv]
-                disc_comps = None
-
-            all_components = torch.cat(all_comps_parts, dim=0)
-            all_sv = torch.cat(all_sv_parts, dim=0)
-
-            # Component ranges
-            flat = torch.stack(voice_tensors).reshape(n_voices, -1).float()
-            centered = flat - analyzer_mean
-            projections = centered @ all_components.T
-            component_ranges = projections.max(dim=0).values - projections.min(dim=0).values
-
-            # Fix discovery ranges
-            n_pca_actual = pca_comps.shape[0]
-            if disc_comps is not None and disc_comps.shape[0] > 0:
-                avg_pca_range = float(component_ranges[:n_pca_actual].mean())
-                component_ranges[n_pca_actual:] = avg_pca_range
-
-            catalog_data = catalog
-        else:
-            # Compute PCA from voices
-            n_pca = min(n_voices - 1, 20)
-            analyzer = VoiceAnalyzer(voice_tensors, n_components=n_pca)
-            pca_comps = analyzer.components
-            pca_sv = analyzer.singular_values
-            pca_mean = analyzer.mean
-
-            all_components = pca_comps
-            all_sv = pca_sv
-
-            flat = torch.stack(voice_tensors).reshape(n_voices, -1).float()
-            centered = flat - pca_mean
-            projections = centered @ all_components.T
-            component_ranges = projections.max(dim=0).values - projections.min(dim=0).values
-
-        component_count = all_components.shape[0]
-        pca_count = pca_comps.shape[0]
-
-        # Assign labels: prefer labels from file, fall back to FEATURE_LABELS / "d{N}"
-        if COMPONENT_LABELS_FILE.exists():
-            try:
-                with open(COMPONENT_LABELS_FILE, "r") as f:
-                    file_labels = json.load(f)
-                # Use file labels up to component_count, pad with dN if file is shorter
-                component_names = []
-                for i in range(component_count):
-                    if i < len(file_labels):
-                        component_names.append(file_labels[i])
-                    else:
-                        component_names.append(f"d{i}")
-                print(f"[server] Loaded {len(file_labels)} labels from {COMPONENT_LABELS_FILE}")
-            except Exception as e:
-                print(f"[server] Could not load labels file ({e}), using defaults")
-                component_names = _default_component_names(pca_comps.shape[0], component_count)
-        else:
-            component_names = _default_component_names(pca_comps.shape[0], component_count)
-        return True
-    except Exception as e:
-        print(f"[server] Could not load components: {e}")
-        return False
 
 # ---------------------------------------------------------------------------
 # API models
 # ---------------------------------------------------------------------------
 class SynthesizeRequest(BaseModel):
     voice: str  # base voice filename (e.g. "af_heart.pt")
-    coefficients: list[float]  # one per component, range [-1, 1]
     text: str
     speed: float = 1.0
-    # When present, sliders are applied in 256-dim style space (style map v2)
-    # instead of component space, and `coefficients` is ignored.
-    styleCoefficients: list[float] | None = None
+    styleCoefficients: list[float]  # one per style feature, range [-1, 1]
 
 
 class ExportVoiceRequest(BaseModel):
     voice: str  # base voice filename (e.g. "af_heart.pt")
-    coefficients: list[float]  # one per component, range [-1, 1]
-    # When present, applied in 256-dim style space and `coefficients` is ignored.
-    styleCoefficients: list[float] | None = None
+    styleCoefficients: list[float]  # one per style feature, range [-1, 1]
 
 
 # ---------------------------------------------------------------------------
@@ -308,7 +141,7 @@ class ExportVoiceRequest(BaseModel):
 # ---------------------------------------------------------------------------
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "styleMap": has_style_map, "components": component_count}
+    return {"status": "ok", "styleMap": has_style_map}
 
 
 @app.get("/api/voices")
@@ -320,13 +153,7 @@ async def list_voices():
 
 @app.get("/api/catalog")
 async def get_catalog():
-    # Deliberately does not trigger the component load — the UI only needs the
-    # style features, and forcing a 530MB read here would defeat lazy loading.
-    result: dict = {
-        "components": [],
-        "count": component_count,
-        "pcaCount": pca_count,
-    }
+    result: dict = {}
     result["hasStyleMap"] = has_style_map
     if has_style_map and style_feature_names is not None:
         # Directions stay server-side: the client only sends slider values, and
@@ -347,21 +174,10 @@ async def export_voice(req: ExportVoiceRequest):
 
     base_voice = load_voice(voice_path)
 
-    if req.styleCoefficients is not None and has_style_map:
-        voice_flat = apply_style_deltas(base_voice, req.styleCoefficients).reshape(-1)
-    else:
-        if not ensure_components_loaded():
-            raise HTTPException(status_code=503,
-                                detail="Component catalog unavailable; send styleCoefficients instead")
-        # Build coefficient tensor
-        coeffs = torch.zeros(component_count)
-        for i, c in enumerate(req.coefficients[:component_count]):
-            coeffs[i] = c
-
-        # Apply: voice = base + sum(coeff * range * component)
-        scaled = coeffs * component_ranges
-        perturbation = (scaled.unsqueeze(0) @ all_components).squeeze(0)
-        voice_flat = base_voice.reshape(-1).float() + perturbation
+    if not has_style_map:
+        raise HTTPException(status_code=503,
+                            detail="No style map loaded. Run build_style_map.py.")
+    voice_flat = apply_style_deltas(base_voice, req.styleCoefficients).reshape(-1)
 
     # Clamp
     base_flat = base_voice.reshape(-1).float()
@@ -437,21 +253,10 @@ async def synthesize(req: SynthesizeRequest):
 
     base_voice = load_voice(voice_path)
 
-    if req.styleCoefficients is not None and has_style_map:
-        voice_flat = apply_style_deltas(base_voice, req.styleCoefficients).reshape(-1)
-    else:
-        if not ensure_components_loaded():
-            raise HTTPException(status_code=503,
-                                detail="Component catalog unavailable; send styleCoefficients instead")
-        # Build coefficient tensor
-        coeffs = torch.zeros(component_count)
-        for i, c in enumerate(req.coefficients[:component_count]):
-            coeffs[i] = c
-
-        # Apply: voice = base + sum(coeff * range * component)
-        scaled = coeffs * component_ranges
-        perturbation = (scaled.unsqueeze(0) @ all_components).squeeze(0)
-        voice_flat = base_voice.reshape(-1).float() + perturbation
+    if not has_style_map:
+        raise HTTPException(status_code=503,
+                            detail="No style map loaded. Run build_style_map.py.")
+    voice_flat = apply_style_deltas(base_voice, req.styleCoefficients).reshape(-1)
 
     # Clamp
     base_flat = base_voice.reshape(-1).float()

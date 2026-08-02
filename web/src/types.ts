@@ -21,16 +21,13 @@ export interface VoicesResponse {
 
 export interface SynthesizeRequest {
   voice: string;
-  /** Kept for the raw component API; the UI sends styleCoefficients instead. */
-  coefficients: number[];
   text: string;
   speed?: number;
   /** Slider values, one per style feature. */
-  styleCoefficients?: number[];
+  styleCoefficients: number[];
 }
 
 export interface ExportVoiceRequest {
   voice: string;
-  coefficients: number[];
-  styleCoefficients?: number[];
+  styleCoefficients: number[];
 }

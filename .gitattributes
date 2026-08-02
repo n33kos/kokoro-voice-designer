@@ -1,1 +1,0 @@
-catalog/discovery_catalog.pt filter=lfs diff=lfs merge=lfs -text

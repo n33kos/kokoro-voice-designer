@@ -46,6 +46,9 @@ cd web && npm install && cd ..
 # Build the style map (~40s) — the web UI needs this
 uv run python build_style_map.py
 
+# Measure the built-in voices (~3 min) — lets voice matching pick a starting voice
+uv run python build_voice_registry.py
+
 # Terminal 1 — backend
 uv run uvicorn server:app --reload --port 8000
 
@@ -96,14 +99,19 @@ This produces a voice that resembles the reference. Only use audio you own or ha
 ```bash
 uv run python invert_voice.py \
   --target reference.wav --target-text reference.txt \
-  --base voices/am_michael.pt \
+  --f0-reference reference.wav \
   --steps 120 --lr 0.02 \
   --reg-weight 50.0 --speaker-weight 2.0 --f0-weight 5.0 \
-  --duration-weight 2.0 \
+  --pacing-weight 2.0 --energy-weight 2.0 \
   --out output/my_voice.pt
 ```
 
-Roughly 30 minutes on CPU for a single 20-second clip. Every synthesis is seeded, so runs are reproducible.
+The starting voice is chosen automatically — whichever built-in already sounds
+most like the reference, by speaker-embedding similarity. Pass `--base` to
+override.
+
+Roughly 30 minutes on CPU for a single 20-second clip. Every synthesis is seeded,
+so runs are reproducible, and checkpoints are written every 5 steps.
 
 ### Multiple clips
 
@@ -120,7 +128,7 @@ uv run python split_reference.py --audio long_recording.wav \
 uv run python invert_voice.py \
   --target input/split/seg02.wav --target-text input/split/seg02.txt \
   --target input/split/seg05.wav --target-text input/split/seg05.txt \
-  ... --base voices/am_michael.pt --out output/my_voice.pt
+  ... --f0-reference long_recording.wav --out output/my_voice.pt
 ```
 
 `split_reference.py` verifies its own alignment by checking that every segment's implied speaking rate is plausible and consistent. This matters: matching an existing transcript to silence-delimited segments *looks* like it should work but often doesn't, because narrators pause mid-sentence and run sentences together. Use `--whisper` to transcribe each segment directly and skip the guesswork.
@@ -136,9 +144,10 @@ Each exists because a measurement showed the previous version was wrong in a spe
 | *(always on)* | WavLM layer-4 pooled statistics — the main "sounds like this voice" term |
 | `--speaker-weight` | Differentiable Resemblyzer embedding. Constrains *identity* where WavLM constrains *texture* |
 | `--reg-weight` | Hinge penalty on leaving the range spanned by the built-in voices. Zero cost inside that range |
-| `--f0-weight` | Matches the reference's log-pitch mean and spread |
-| `--duration-weight` | Lengthens phonemes Kokoro allocates too little time to |
+| `--f0-weight` | Matches the reference's log-pitch distribution — register and asymmetry, not just an average |
 | `--pacing-weight` | Matches overall speaking rate |
+| `--energy-weight` | Matches how much loudness varies |
+| `--duration-weight` | Lengthens phonemes Kokoro allocates too little time to. Off by default — it flattened natural timing into staccato |
 
 Two notes worth knowing:
 
@@ -162,40 +171,6 @@ Scores candidates on held-out text and writes samples for listening.
 
 ---
 
-## Discovery and the component catalog
-
-An older, separate line of work, still used by `auto_mode.py`. PCA over Kokoro's built-in voices finds the axes of greatest variation; discovery probes random directions orthogonal to PCA to find impactful dimensions the voice library doesn't vary along. `build_catalog.py` distills the results.
-
-The server loads the catalog lazily — nothing in the web UI needs it, so it is
-only read if a request arrives using raw component coefficients. Startup is
-otherwise unaffected by its size.
-
-This powers `auto_mode.py`, a coordinate-descent optimizer that predates the gradient-based approach. It fits a voice to a reference recording the same way `invert_voice.py` does, but by black-box search rather than gradients, and it converges to a noticeably worse result for far more compute. Prefer `invert_voice.py`. Discovery remains useful for exploring directions outside the built-in voice distribution.
-
-### The catalog and Git LFS
-
-`catalog/discovery_catalog.pt` is ~530MB, over GitHub's 100MB per-file limit, so it is stored with [Git LFS](https://git-lfs.com):
-
-```bash
-brew install git-lfs   # or: apt install git-lfs
-git lfs install && git lfs pull
-```
-
-Without LFS the repo still clones and everything except the catalog works — you'll get a pointer file instead. To rebuild it yourself:
-
-```bash
-# Accumulate discoveries (slow — hours for a mature cache; stop with Ctrl+C anytime)
-uv run python auto_mode.py --base-voice voices/af_heart.pt \
-  --target-audio input/sample.wav --target-text "transcript" --n-probes 200
-
-# Distill into a catalog (fast)
-uv run python build_catalog.py --n-discoveries 1000
-```
-
-Note the real cost: the discovery cache is ~1GB and represents many hours of probing. **You don't need the catalog for the designer or for voice matching** — `build_style_map.py` and `invert_voice.py` work directly from Kokoro and a base voice.
-
----
-
 ## Project structure
 
 ```
@@ -208,21 +183,18 @@ voice-designer/
 ├── split_reference.py       # Cut a long recording into transcribed clips
 ├── test_differentiable.py   # Gate: our forward pass must match stock Kokoro
 ├── server.py                # FastAPI backend
-├── auto_mode.py             # Older coordinate-descent loop + discovery
-├── build_catalog.py         # Distill PCA + discoveries into a catalog
-├── label_components.py      # Name raw components (catalog workflow only)
-├── prune_cache.py           # Trim the discovery cache to top-N
+├── build_voice_registry.py  # Measure built-in voices (base-voice selection)
 ├── synthesize.py            # Quick test synthesis from any .pt voice
 ├── core/
 │   ├── differentiable_kokoro.py  # Kokoro forward pass with gradients enabled
 │   ├── perceptual_loss.py        # WavLM, pacing, F0 and duration losses
 │   ├── speaker_loss.py           # Differentiable Resemblyzer + manifold bounds
 │   ├── spectral_features.py      # Differentiable audio features
-│   ├── voice_analyzer.py         # PCA decomposition
 │   ├── speech_generator.py       # Kokoro wrapper (seedable)
-│   ├── discovery.py              # Orthogonal direction probing
-│   └── fitness_scorer.py         # Similarity metrics
-├── catalog/style_map.json   # Slider axes (regenerate with build_style_map.py)
+│   └── fitness_scorer.py         # Resemblyzer similarity, for evaluation
+├── catalog/
+│   ├── style_map.json       # Slider axes (build_style_map.py)
+│   └── voice_registry.json  # Built-in voice measurements (build_voice_registry.py)
 ├── voices/                  # .pt voice files
 └── web/                     # React + TypeScript frontend
 ```

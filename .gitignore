@@ -23,3 +23,6 @@ input/*
 # Web frontend build artifacts
 web/node_modules/
 web/dist/
+
+# Old approach: discovery catalog is no longer used or produced.
+catalog/discovery_catalog.pt

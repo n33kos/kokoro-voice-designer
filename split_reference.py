@@ -48,9 +48,15 @@ warnings.filterwarnings("ignore", message=".*resized since it had shape.*", cate
 warnings.filterwarnings("ignore", message=".*n_fft=.*is too large.*", category=UserWarning)
 
 SR = 24000
-# Plausible range for read speech, in phonemes per second. Anything outside this
-# means the sentence-to-segment mapping slipped.
-RATE_MIN, RATE_MAX = 8.0, 18.0
+# Plausible range for speech, in phonemes per second. Wide on purpose: speakers
+# genuinely differ a lot (measured 15 for one narrator, 21 for another), so an
+# absolute rate is weak evidence. Consistency is the real signal — a slipped
+# alignment shows up as *scattered* rates, not as uniformly fast ones, which is
+# what SPREAD_MAX below actually tests.
+RATE_MIN, RATE_MAX = 7.0, 26.0
+# Relative standard deviation of per-segment rate. One speaker reading
+# continuous prose stays well inside this.
+SPREAD_MAX = 0.25
 
 WHISPER_BIN = Path.home() / ".claude/voice-multiplexer/whisper/whisper.cpp/build/bin/whisper-cli"
 WHISPER_MODEL = Path.home() / ".claude/voice-multiplexer/whisper/models/ggml-large-v3-turbo.bin"
@@ -186,7 +192,7 @@ def main() -> int:
     spread = float(np.std(rates)) / max(float(np.mean(rates)), 1e-6)
     print(f"Rate: mean {np.mean(rates):.1f}, relative spread {spread:.1%}, "
           f"{len(bad)} implausible")
-    if bad or spread > 0.25:
+    if bad or spread > SPREAD_MAX:
         print("\nAlignment looks WRONG — rates should be tight for one speaker. "
               "Do not train on these without checking.")
         return 1

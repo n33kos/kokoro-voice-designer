@@ -44,12 +44,16 @@ warnings.filterwarnings("ignore", message=".*RNN module weights are not part of 
 from core import SpeechGenerator
 from core.differentiable_kokoro import DifferentiableKokoro
 from core.perceptual_loss import (
+    F0_DENSE_QUANTILES,
     FRAME_HOP,
     KOKORO_SR,
     WavLMPooledLoss,
     duration_floor_loss,
-    f0_reference_stats,
-    f0_stats_loss,
+    energy_dynamics_loss,
+    energy_reference_cv,
+    estimate_pitch_range,
+    f0_distribution_loss,
+    f0_reference_distribution,
     pacing_loss,
     speaking_rate,
 )
@@ -58,6 +62,15 @@ from core.speaker_loss import (
     build_manifold_bounds,
     manifold_penalty,
 )
+
+# Voices produced by this project rather than shipped with Kokoro. Excluded when
+# measuring what counts as a plausible voice.
+DERIVED_VOICES = {
+    "af_kate_reading", "am_michael_kramer",
+    "af_mica", "af_quartz", "af_amber", "am_granite", "am_slate", "am_ash",
+}
+
+VOICE_REGISTRY = Path(__file__).parent / "catalog" / "voice_registry.json"
 
 PROJECT_ROOT = Path(__file__).parent
 VOICES_DIR = PROJECT_ROOT / "voices"
@@ -82,6 +95,48 @@ def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def pick_base_voice(reference_audio: np.ndarray, exclude: set[str]) -> str | None:
+    """Choose the built-in voice that already sounds most like the reference.
+
+    The manifold constraint caps how far a voice may travel, so starting far
+    from the target spends that budget on getting to the right vicinity rather
+    than on identity. A match started ~20% below the speaker's register came out
+    27% high with its pitch asymmetry inverted; runs started near their target
+    landed within a few percent.
+
+    Selection is by speaker-embedding similarity, not register. Register alone
+    picked a male voice for a female speaker and a Portuguese voice for an
+    English one — it says nothing about who a voice sounds like. Candidates are
+    restricted to English packs because the pipeline runs lang_code="a".
+
+    Requires catalog/voice_registry.json (build_voice_registry.py).
+    """
+    if not VOICE_REGISTRY.exists():
+        return None
+    import json
+    from resemblyzer import VoiceEncoder, preprocess_wav
+
+    registry = json.loads(VOICE_REGISTRY.read_text())
+    if not any("embedding" in e for e in registry.values()):
+        return None
+
+    encoder = VoiceEncoder(device="cpu", verbose=False)
+    ref = encoder.embed_utterance(preprocess_wav(reference_audio, source_sr=KOKORO_SR))
+
+    best, best_sim = None, -1.0
+    for name, entry in registry.items():
+        if name in exclude or "embedding" not in entry:
+            continue
+        if not name.startswith(("af_", "am_", "bf_", "bm_")):
+            continue
+        if not (VOICES_DIR / f"{name}.pt").exists():
+            continue
+        sim = float(np.dot(ref, np.array(entry["embedding"])))
+        if sim > best_sim:
+            best, best_sim = name, sim
+    return best
+
+
 def load_voice(path) -> torch.Tensor:
     try:
         return torch.load(path, weights_only=True)
@@ -99,7 +154,8 @@ class StyleParameterization(torch.nn.Module):
     actually train on.
     """
 
-    def __init__(self, base_voice: torch.Tensor, n_basis: int = 6, device: str = "cpu"):
+    def __init__(self, base_voice: torch.Tensor, n_basis: int = 6, device: str = "cpu",
+                 row_range: tuple[int, int] | None = None):
         super().__init__()
         if n_basis < 1:
             raise ValueError("n_basis must be at least 1")
@@ -113,12 +169,46 @@ class StyleParameterization(torch.nn.Module):
         # Cosine (DCT-II style) basis over the normalized length axis.
         t = torch.linspace(0, 1, self.n_rows, device=device).unsqueeze(1)
         k = torch.arange(n_basis, device=device).unsqueeze(0)
-        self.register_buffer("basis", torch.cos(np.pi * t * k))  # [510, n_basis]
+        basis = torch.cos(np.pi * t * k)                          # [510, n_basis]
+
+        # Only rows matching a training length are constrained; beyond them the
+        # cosines keep curving, which drifts pitch on utterances longer or
+        # shorter than anything seen. Measured: a profile trained on rows 30-180
+        # rendered 97 Hz inside that span and 110 Hz at row 333. Holding the
+        # basis flat outside the trained range removes that failure mode while
+        # leaving the profile free where there is data.
+        if row_range is not None:
+            lo_row, hi_row = row_range
+            lo_row = max(0, min(lo_row, self.n_rows - 1))
+            hi_row = max(lo_row, min(hi_row, self.n_rows - 1))
+            basis[:lo_row] = basis[lo_row]
+            basis[hi_row + 1:] = basis[hi_row]
+            self.row_range = (lo_row, hi_row)
+        else:
+            self.row_range = (0, self.n_rows - 1)
+        self.register_buffer("basis", basis)
 
     def voice(self) -> torch.Tensor:
-        """Full [510, 256] style tensor with current offsets applied."""
+        """Full [510, 256] style tensor with current offsets applied.
+
+        Outside the trained row range the whole prosody row is copied from the
+        nearest trained row, not just the offset. Holding the offset flat is not
+        enough: the final row is `base[row] + offset`, and the base voice's own
+        prosody varies ~55% across rows, so beyond the trained range an offset
+        fitted for one base row was being applied to a different one. Measured
+        effect was severe — utterances past the trained range ran 46% to 118%
+        too fast while trained lengths were accurate.
+        """
         timbre = self.base[:, :128] + self.timbre_delta.unsqueeze(0)
         prosody = self.base[:, 128:] + (self.basis @ self.prosody_coeffs)
+        lo_row, hi_row = self.row_range
+        if lo_row > 0:
+            prosody = torch.cat([prosody[lo_row:lo_row + 1].expand(lo_row, -1),
+                                 prosody[lo_row:]], dim=0)
+        if hi_row < self.n_rows - 1:
+            prosody = torch.cat([prosody[:hi_row + 1],
+                                 prosody[hi_row:hi_row + 1].expand(
+                                     self.n_rows - hi_row - 1, -1)], dim=0)
         return torch.cat([timbre, prosody], dim=-1)
 
     def row(self, phoneme_count: int) -> torch.Tensor:
@@ -158,8 +248,11 @@ def invert(
     speaker: SpeakerEmbeddingLoss | None = None,
     target_embed: torch.Tensor | None = None,
     speaker_weight: float = 0.0,
-    f0_target: tuple[float, float] | None = None,
+    f0_target: list[float] | None = None,
+    pitch_band: tuple[float, float] = (50.0, 400.0),
     f0_weight: float = 0.0,
+    energy_target: float | None = None,
+    energy_weight: float = 0.0,
     duration_weight: float = 0.0,
     duration_min_frames: float = 2.0,
     bounds: tuple[torch.Tensor, torch.Tensor] | None = None,
@@ -204,14 +297,60 @@ def invert(
         if out_path is not None:
             torch.save(params.as_voice_tensor(), out_path)
 
+    # The F0 loss reads Kokoro's internal F0_pred, but the target was measured
+    # with yin on a real waveform. Those disagree on identical audio by a factor
+    # that varies with the voice (0.80-1.01 across the built-ins) and drifts as
+    # the voice moves during training — am_michael starts at 0.99 and reached
+    # 1.06 by the end of a run, so the loss reported success while the rendered
+    # pitch sat 6% sharp. Re-measuring periodically closes that loop.
+    f0_offset = [0.0] * len(F0_DENSE_QUANTILES)
+
+    def recalibrate(f0_target):
+        """Shift the F0 target so rendered pitch, not F0_pred, hits the mark.
+
+        Averaged over every training length: the gap varies by row, so
+        correcting from a single utterance leaves the other lengths off.
+        """
+        nonlocal f0_offset
+        # One offset per quantile. A single scalar cannot correct this: measured
+        # against two references, the low quantiles needed almost no correction
+        # while the upper half ran 11-17% high. The error is a stretch, not a
+        # shift, so it takes a per-quantile correction.
+        rows = []
+        for _, ps, ctx in contexts:
+            torch.manual_seed(SEED)
+            with torch.no_grad():
+                out = diff.forward(ctx, params.row(len(ps)))
+            f0 = out.f0_pred.squeeze()
+            v = f0[f0 > 30.0]
+            if v.numel() < 8:
+                continue
+            internal = np.quantile(np.log(v.detach().cpu().numpy()), F0_DENSE_QUANTILES)
+            y = librosa.yin(out.audio.detach().cpu().numpy(),
+                            fmin=pitch_band[0], fmax=pitch_band[1], sr=KOKORO_SR)
+            voiced = y[(y > pitch_band[0] * 1.02) & (y < pitch_band[1] * 0.98)]
+            if len(voiced) < 10:
+                continue
+            rendered = np.quantile(np.log(voiced), F0_DENSE_QUANTILES)
+            rows.append(internal - rendered)
+        if not rows:
+            return
+        f0_offset = list(np.mean(rows, axis=0))
+        return f0_offset
+
     for step in range(start_step, steps):
+        if f0_target is not None and f0_weight > 0 and step % 10 == 0:
+            off = recalibrate(f0_target)
+            if off is not None and step % 30 == 0:
+                log("  F0 calibration (rendered/internal) across distribution: "
+                    + " ".join(f"{np.exp(-off[i]):.3f}" for i in (0, 6, 12, 18, 24)))
         # Full batch over every training text. Cycling one text per step is
         # high-variance SGD: loss levels differ several-fold between texts, so
         # individual steps chase whichever text came up rather than descending
         # the shared objective. Accumulating over all texts makes each step a
         # genuine descent direction.
         opt.zero_grad()
-        totals = {"perceptual": 0.0, "pacing": 0.0, "speaker": 0.0, "f0": 0.0, "dur": 0.0}
+        totals = {"perceptual": 0.0, "pacing": 0.0, "speaker": 0.0, "f0": 0.0, "energy": 0.0, "dur": 0.0}
         total_loss = 0.0
 
         for text, ps, ctx in contexts:
@@ -252,9 +391,16 @@ def invert(
             # Pitch distribution. Generated voices ran ~2x the reference's rate
             # of large pitch excursions, heard as spiking at word ends.
             if f0_target is not None and f0_weight > 0:
-                lf = f0_stats_loss(out.f0_pred, f0_target[0], f0_target[1])
+                # Aim the internal statistic at target + offset, so the audible
+                # pitch lands on target.
+                lf = f0_distribution_loss(out.f0_pred, f0_target, offset=f0_offset)
                 loss = loss + f0_weight * lf
                 totals["f0"] += float(lf)
+
+            if energy_target is not None and energy_weight > 0:
+                le = energy_dynamics_loss(out.n_pred, energy_target)
+                loss = loss + energy_weight * le
+                totals["energy"] += float(le)
 
             # Lengthen phonemes Kokoro swallows, without slowing everything.
             if duration_weight > 0:
@@ -308,7 +454,8 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--target", help="Reference audio (.wav). Repeatable.", action="append")
     ap.add_argument("--sanity-check", help="Built-in voice filename to recover (proof test)")
-    ap.add_argument("--base", default=str(VOICES_DIR / "af_heart.pt"), help="Starting voice")
+    ap.add_argument("--base", help="Starting voice. Defaults to the built-in whose "
+                                   "register is closest to the reference.")
     ap.add_argument("--target-text", action="append",
                     help="Transcript for the corresponding --target, as a file path "
                          "or literal text. Repeat once per clip, in the same order. "
@@ -320,12 +467,19 @@ def main() -> int:
     # which 2e-4 cannot cover in a few hundred steps.
     ap.add_argument("--lr", type=float, default=0.02)
     ap.add_argument("--n-basis", type=int, default=6, help="Prosody basis functions")
-    ap.add_argument("--pacing-weight", type=float, default=0.1)
+    # Was 0.1 against a pitch weight of 5.0, i.e. fifty times weaker, which left
+    # speaking rate effectively unconstrained.
+    ap.add_argument("--pacing-weight", type=float, default=2.0)
+    ap.add_argument("--energy-weight", type=float, default=0.0,
+                    help="Weight on matching how much loudness varies")
     ap.add_argument("--speaker-weight", type=float, default=0.0,
                     help="Weight on the differentiable Resemblyzer speaker loss. "
                          "Complements the WavLM term, which optimizes texture "
                          "rather than identity. Note this makes Resemblyzer a "
                          "training target, so evaluate with something else too.")
+    ap.add_argument("--f0-reference",
+                    help="Audio to take the pitch target from. Use the original "
+                         "unsegmented recording when training on split clips.")
     ap.add_argument("--f0-weight", type=float, default=0.0,
                     help="Weight on matching the reference's log-F0 mean and spread; "
                          "targets excess pitch excursions at word ends")
@@ -361,6 +515,18 @@ def main() -> int:
     log("Loading WavLM...")
     perceptual = WavLMPooledLoss(device=args.device)
 
+    if not args.base:
+        ref_for_base = (librosa.load(args.f0_reference, sr=KOKORO_SR, mono=True)[0]
+                        if args.f0_reference
+                        else target_audio[0].detach().cpu().numpy())
+        picked = pick_base_voice(ref_for_base, DERIVED_VOICES)
+        if picked is None:
+            log("No voice registry; defaulting to af_heart. "
+                "Run build_voice_registry.py to enable automatic selection.")
+            args.base = str(VOICES_DIR / "af_heart.pt")
+        else:
+            args.base = str(VOICES_DIR / f"{picked}.pt")
+            log(f"Auto-selected base voice: {picked}")
     base_voice = load_voice(args.base)
 
     # --- Build target statistics ---
@@ -450,7 +616,11 @@ def main() -> int:
     if n_basis < args.n_basis:
         log(f"Limiting prosody basis to {n_basis} ({n_anchors} distinct training "
             f"length(s); {args.n_basis} requested would be underdetermined)")
-    params = StyleParameterization(base_voice, n_basis=n_basis, device=args.device)
+    train_rows = sorted(len(diff.phonemize(gen.pipeline, t)) - 1 for t in train_texts)
+    params = StyleParameterization(base_voice, n_basis=n_basis, device=args.device,
+                                   row_range=(train_rows[0], train_rows[-1]))
+    log(f"Prosody profile free across rows {train_rows[0]}-{train_rows[-1]}, "
+        f"held flat outside")
 
     log("Computing target statistics...")
     if args.sanity_check or args.target_text:
@@ -474,16 +644,52 @@ def main() -> int:
         target_embed = target_embed / target_embed.norm(dim=1, keepdim=True)
 
     f0_target = None
+    pitch_band = (50.0, 400.0)
     if args.f0_weight > 0:
-        ref = target_audio[0].detach().cpu().numpy()
-        f0_target = f0_reference_stats(ref)
-        log(f"F0 target from reference: log-mean={f0_target[0]:.3f} "
-            f"({np.exp(f0_target[0]):.1f} Hz), log-std={f0_target[1]:.3f}")
+        # Pool across every clip, not just the first. Individual clips vary a
+        # lot: across one speaker's segments the per-clip median ranged 84-117 Hz
+        # against 96 Hz for the whole recording, so taking clip zero aimed the
+        # pitch target ~20% high and the result audibly missed. Concatenating
+        # weights each clip by its length, which is what we want.
+        if args.f0_reference:
+            # Prefer the original unsegmented recording. Segments skew high
+            # relative to the whole: pooling the clips gave 97.1 Hz where the
+            # full recording is 96.3, and the result rendered ~10 Hz sharp at
+            # every length.
+            ref, _ = librosa.load(args.f0_reference, sr=KOKORO_SR, mono=True)
+            log(f"F0 target from {Path(args.f0_reference).name} (full recording)")
+        else:
+            ref = np.concatenate([a.detach().cpu().numpy() for a in target_audio])
+        pitch_band = estimate_pitch_range(ref)
+        log(f"Pitch analysis band from reference: "
+            f"{pitch_band[0]:.0f}-{pitch_band[1]:.0f} Hz")
+        f0_target = f0_reference_distribution(ref, band=pitch_band)
+        log(f"F0 target: {len(f0_target)}-level distribution, "
+            + " ".join(f"{np.exp(f0_target[i]):.0f}" for i in (0, 6, 12, 18, 24))
+            + " Hz at p2/p26/p50/p74/p98")
+
+    energy_target = None
+    if args.energy_weight > 0:
+        ref_e = (librosa.load(args.f0_reference, sr=KOKORO_SR, mono=True)[0]
+                 if args.f0_reference
+                 else np.concatenate([a.detach().cpu().numpy() for a in target_audio]))
+        energy_target = energy_reference_cv(ref_e)
+        log(f"Energy variation target (coefficient of variation): {energy_target:.3f}")
 
     bounds = None
     if args.reg_weight > 0:
+        # Only Kokoro's own voices define the manifold. Voices we generated sit
+        # at its edge by construction, and reference-fitted ones were pushed
+        # outward deliberately — including either widens the bounds the
+        # constraint is supposed to enforce. Measured at 8% wider with six of
+        # ours present, which is the constraint quietly loosening itself.
         lib = [load_voice(VOICES_DIR / f) for f in sorted(os.listdir(VOICES_DIR))
-               if f.endswith(".pt")]
+               if f.endswith(".pt") and f[:3] in ("af_", "am_", "bf_", "bm_",
+                                                  "ef_", "em_", "ff_", "hf_",
+                                                  "hm_", "if_", "im_", "jf_",
+                                                  "jm_", "pf_", "pm_", "zf_",
+                                                  "zm_")
+               and f[:-3] not in DERIVED_VOICES]
         bounds = build_manifold_bounds(lib, margin=args.reg_margin)
         bounds = (bounds[0].to(args.device), bounds[1].to(args.device))
         log(f"Manifold bounds from {len(lib)} voices, margin {args.reg_margin}")
@@ -503,6 +709,9 @@ def main() -> int:
         speaker_weight=args.speaker_weight,
         f0_target=f0_target,
         f0_weight=args.f0_weight,
+        pitch_band=pitch_band,
+        energy_target=energy_target,
+        energy_weight=args.energy_weight,
         duration_weight=args.duration_weight,
         duration_min_frames=args.duration_min_frames,
         bounds=bounds,

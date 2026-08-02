@@ -78,7 +78,7 @@ export default function App() {
 
   const resynthesize = useCallback(
     (voice: string, newText: string) => {
-      requestSynthesis(voice, [], newText, styleCoefficients);
+      requestSynthesis(voice, newText, styleCoefficients);
     },
     [styleCoefficients, requestSynthesis],
   );
@@ -129,7 +129,7 @@ export default function App() {
       setStyleCoefficients((prev) => {
         const next = [...prev];
         next[index] = value;
-        requestSynthesis(selectedVoice, [], text, next);
+        requestSynthesis(selectedVoice, text, next);
         return next;
       });
     },
@@ -139,7 +139,7 @@ export default function App() {
   const handleReset = useCallback(() => {
     const zeroed = new Array(styleFeatures.length).fill(0);
     setStyleCoefficients(zeroed);
-    requestSynthesis(selectedVoice, [], text, zeroed);
+    requestSynthesis(selectedVoice, text, zeroed);
   }, [styleFeatures.length, selectedVoice, text, requestSynthesis]);
 
   const triggerDownload = useCallback((data: ArrayBuffer, filename: string, mime: string) => {
@@ -158,11 +158,7 @@ export default function App() {
     if (!selectedVoice) return;
     setExportingVoice(true);
     try {
-      const data = await exportVoice({
-        voice: selectedVoice,
-        coefficients: [],
-        styleCoefficients,
-      });
+      const data = await exportVoice({ voice: selectedVoice, styleCoefficients });
       triggerDownload(data, 'designed_voice.pt', 'application/octet-stream');
     } catch (err) {
       console.error('Voice export failed:', err);
