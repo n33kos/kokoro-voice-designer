@@ -475,7 +475,18 @@ def invert(
             rows.append(internal - rendered)
         if not rows:
             return
-        f0_offset = list(np.mean(rows, axis=0))
+        # Smooth the offset across quantile levels before using it. Each level
+        # is estimated from the frames that land near it, and at p90/p98 on a
+        # 2-6 s clip that is very few — so the tail offsets are dominated by
+        # noise, which is exactly where `f0_range_loss` operates. Symptom: that
+        # term finished at 0.00003 (satisfied) on a voice whose rendered p90 was
+        # still 10% below target. A quadratic in the quantile level keeps the
+        # real shape — the gap is a stretch, not a shift — while discarding
+        # per-level jitter.
+        raw = np.mean(rows, axis=0)
+        levels = np.asarray(F0_DENSE_QUANTILES, dtype=np.float64)
+        fit = np.polyfit(levels, raw, 2)
+        f0_offset = list(np.polyval(fit, levels))
         return f0_offset
 
     for step in range(start_step, steps):
