@@ -63,6 +63,9 @@ from core.perceptual_loss import (
     creak_reference_fraction,
     pause_share_loss,
     punctuation_duration_loss,
+    boundary_duration_loss,
+    subharmonic_loss,
+    subharmonic_reference,
     declination_loss,
     declination_reference,
     f0_distribution_loss,
@@ -296,6 +299,8 @@ def invert(
     duration_spread_weight: float = 0.0,
     noise_floor_weight: float = 0.0,
     punctuation_weight: float = 0.0,
+    subharmonic_weight: float = 0.0,
+    subharmonic_bound: tuple[float, float] | None = None,
     bounds: tuple[torch.Tensor, torch.Tensor] | None = None,
     ground_truth: torch.Tensor | None = None,
     checkpoint_path: Path | None = None,
@@ -323,6 +328,7 @@ def invert(
     # Base-voice duration for each punctuation class, per text. Sentence breaks
     # and commas are kept apart on purpose — see `punctuation_duration_loss`.
     punctuation_targets = {}
+    boundary_targets = {}
     long_ctx = None
     if punctuation_weight > 0:
         # The defect appears past the trained rows, so constrain a long passage
@@ -341,6 +347,7 @@ def invert(
                 long_targets.append((m, float(dl[mm].mean())))
         sp = dl[long_ctx.phoneme_mask[:dl.numel()]]
         long_spread = float(sp.std() / sp.mean().clamp(min=1e-6))
+        long_boundary = float(dl[0])
         log(f"Long-passage anchor: row {long_row}, base sentence break "
             f"{long_targets[0][1] * 600 / KOKORO_SR * 1000:.0f}ms, spread {long_spread:.2f}")
         for text, ps, ctx in contexts:
@@ -354,6 +361,7 @@ def invert(
                 if int(mm.sum()):
                     entry.append((m, float(d[mm].mean())))
             punctuation_targets[text] = entry
+            boundary_targets[text] = float(d[0])
         shown = [f"{t * 600 / KOKORO_SR * 1000:.0f}ms"
                  for e in punctuation_targets.values() for _, t in e]
         log("Punctuation length in the base voice: " + ", ".join(shown))
@@ -480,7 +488,7 @@ def invert(
         # the shared objective. Accumulating over all texts makes each step a
         # genuine descent direction.
         opt.zero_grad()
-        totals = {"perceptual": 0.0, "pacing": 0.0, "speaker": 0.0, "f0": 0.0, "contour": 0.0, "creak": 0.0, "declination": 0.0, "pause": 0.0, "durspread": 0.0, "floor": 0.0, "punct": 0.0, "energy": 0.0, "dur": 0.0}
+        totals = {"perceptual": 0.0, "pacing": 0.0, "speaker": 0.0, "f0": 0.0, "contour": 0.0, "creak": 0.0, "declination": 0.0, "pause": 0.0, "durspread": 0.0, "floor": 0.0, "punct": 0.0, "subharm": 0.0, "energy": 0.0, "dur": 0.0}
         total_loss = 0.0
 
         for text, ps, ctx in contexts:
@@ -558,9 +566,16 @@ def invert(
                 totals["energy"] += float(le)
 
             if punctuation_weight > 0 and punctuation_targets.get(text):
-                lpn = punctuation_duration_loss(out.duration, punctuation_targets[text])
+                lpn = (punctuation_duration_loss(out.duration, punctuation_targets[text])
+                       + boundary_duration_loss(out.duration, boundary_targets[text]))
                 loss = loss + punctuation_weight * lpn
                 totals["punct"] += float(lpn)
+
+            if subharmonic_weight > 0 and subharmonic_bound is not None:
+                lsh = subharmonic_loss(out.audio, subharmonic_bound[0],
+                                       subharmonic_bound[1])
+                loss = loss + subharmonic_weight * lsh
+                totals["subharm"] += float(lsh)
 
             if noise_floor_weight > 0 and text in noise_floor_bounds:
                 lnf = noise_floor_loss(out.audio, noise_floor_bounds[text])
@@ -600,6 +615,7 @@ def invert(
             lo = diff.forward(long_ctx, params.row(len(long_ctx.phonemes)),
                               decode=False)
             llp = (punctuation_duration_loss(lo.duration, long_targets)
+                   + boundary_duration_loss(lo.duration, long_boundary)
                    + duration_spread_loss(lo.duration, long_ctx.phoneme_mask,
                                           long_spread))
             (punctuation_weight * llp).backward()
@@ -670,6 +686,9 @@ def main() -> int:
     ap.add_argument("--duration-spread-weight", type=float, default=0.0,
                     help="Weight on keeping phoneme-length variation where the "
                          "base voice had it")
+    ap.add_argument("--subharmonic-weight", type=float, default=0.0,
+                    help="Weight on keeping energy below the fundamental down "
+                         "(low-frequency graininess)")
     ap.add_argument("--punctuation-weight", type=float, default=0.0,
                     help="Weight on keeping pauses at punctuation as long as the "
                          "base voice made them")
@@ -923,6 +942,17 @@ def main() -> int:
         log(f"Declination target: {declination_target:+.3f} log-units of pitch "
             f"per second within a phrase")
 
+    subharmonic_bound = None
+    if args.subharmonic_weight > 0 and args.f0_reference:
+        ref_sh, _ = librosa.load(args.f0_reference, sr=KOKORO_SR, mono=True)
+        ref_f0 = float(np.median(pitch.track(ref_sh, KOKORO_SR).values))
+        # Bound from the reference itself, with headroom. The base voice is not
+        # a good source here: it is a different speaker at a different register.
+        share = subharmonic_reference(ref_sh, ref_f0)
+        subharmonic_bound = (ref_f0, max(share * 1.5, 0.004))
+        log(f"Subharmonic bound: {100*subharmonic_bound[1]:.2f}% of energy below "
+            f"{ref_f0*0.75:.0f} Hz (reference sits at {100*share:.2f}%)")
+
     energy_target = None
     if args.energy_weight > 0:
         ref_e = (librosa.load(args.f0_reference, sr=KOKORO_SR, mono=True)[0]
@@ -975,6 +1005,8 @@ def main() -> int:
         duration_spread_weight=args.duration_spread_weight,
         noise_floor_weight=args.noise_floor_weight,
         punctuation_weight=args.punctuation_weight,
+        subharmonic_weight=args.subharmonic_weight,
+        subharmonic_bound=subharmonic_bound,
         energy_target=energy_target,
         energy_weight=args.energy_weight,
         duration_weight=args.duration_weight,

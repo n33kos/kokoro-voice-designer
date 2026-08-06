@@ -411,6 +411,71 @@ def punctuation_duration_loss(duration: torch.Tensor,
     return total
 
 
+def boundary_duration_loss(duration: torch.Tensor, base_frames: float,
+                           ceiling_ratio: float = 1.5) -> torch.Tensor:
+    """Cap the leading token, which nothing else constrains.
+
+    Kokoro's token sequence is `[BOS, *phonemes, EOS]`. The BOS token is not in
+    `phoneme_mask`, so `duration_spread_loss` cannot see it;
+    `punctuation_duration_loss` is one-sided, so lengthening is free; and
+    `pacing_loss` averages over the whole utterance, where one long token barely
+    registers. It was completely unconstrained, and it ran away: measured at
+    **975 ms on one fitted voice** against 250 ms for the stock voice it started
+    from, 325-350 ms for the other fitted voices. A listener heard it as "an
+    audible artifact at the start... a long robotic sounding stretching of a
+    vowel" that cleared once speech began.
+
+    A one-sided hinge above `ceiling_ratio` x the base voice's own leading token.
+    Shortening is free; only running long costs.
+    """
+    d = duration.squeeze()
+    if d.numel() < 2 or base_frames <= 0:
+        return d.sum() * 0.0
+    ceiling = base_frames * ceiling_ratio
+    return ((d[0] - ceiling).clamp(min=0.0) / max(base_frames, 1e-6)) ** 2
+
+
+def subharmonic_reference(audio: np.ndarray, f0_hz: float,
+                          sr: int = KOKORO_SR) -> float:
+    """Share of voiced-band energy sitting *below* the fundamental."""
+    with torch.no_grad():
+        return float(subharmonic_energy(
+            torch.from_numpy(np.asarray(audio, dtype=np.float32)), f0_hz, sr))
+
+
+def subharmonic_energy(audio: torch.Tensor, f0_hz: float,
+                       sr: int = KOKORO_SR) -> torch.Tensor:
+    """Energy below `0.75 x f0` as a fraction of energy below 4 kHz.
+
+    Nothing can be lower than the fundamental except a subharmonic, and
+    subharmonics are what roughness is. Measured against one reference: the real
+    speaker sits at 0.39% and the stock voice at 0.50%, while the fitted voice
+    reached 1.07% — heard as "a low frequency croakiness... almost grainy or
+    growly". Jitter was normal on the same audio, so this is not period
+    irregularity; it is genuine energy under the fundamental.
+
+    Differentiable through `torch.stft`, so it can be applied to rendered audio.
+    """
+    x = audio.squeeze()
+    n_fft = 2048
+    if x.numel() < n_fft:
+        return x.sum() * 0.0
+    window = torch.hann_window(n_fft, device=x.device, dtype=x.dtype)
+    spec = torch.stft(x, n_fft=n_fft, hop_length=512, window=window,
+                      return_complex=True).abs()
+    freqs = torch.linspace(0, sr / 2, spec.shape[0], device=x.device, dtype=x.dtype)
+    below = spec[freqs < f0_hz * 0.75].sum()
+    total = spec[freqs < 4000.0].sum().clamp(min=1e-9)
+    return below / total
+
+
+def subharmonic_loss(audio: torch.Tensor, f0_hz: float, max_share: float,
+                     sr: int = KOKORO_SR) -> torch.Tensor:
+    """Hinge on energy below the fundamental. Free up to `max_share`."""
+    share = subharmonic_energy(audio, f0_hz, sr)
+    return ((share - max_share).clamp(min=0.0) / max(max_share, 1e-6)) ** 2
+
+
 def declination_loss(f0_pred: torch.Tensor, target_slope: float,
                      voiced_threshold: float = 50.0) -> torch.Tensor:
     """Match how fast pitch drifts down across a phrase.
