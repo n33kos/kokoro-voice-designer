@@ -30,8 +30,12 @@ TEXT = ("The morning after the storm, the whole village came down to the water "
 
 
 def profile(audio):
-    f0 = librosa.yin(audio, fmin=50, fmax=400, sr=24000)
-    v = f0[(f0 > 55) & (f0 < 350)]
+    # Same tracker as every other pitch measurement in the project. yin with a
+    # fixed band reports 8-13% octave jumps on real speech; see core.pitch.
+    from core import pitch
+
+    track = pitch.track(audio, 24000)
+    v = track.values
     if len(v) < 20:
         return None
     lg = np.log(v)

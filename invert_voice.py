@@ -41,19 +41,30 @@ warnings.filterwarnings("ignore", message=".*resized since it had shape.*", cate
 warnings.filterwarnings("ignore", message=".*n_fft=.*is too large for input signal.*", category=UserWarning)
 warnings.filterwarnings("ignore", message=".*RNN module weights are not part of single contiguous chunk.*", category=UserWarning)
 
-from core import SpeechGenerator
+from core import SpeechGenerator, pitch
 from core.differentiable_kokoro import DifferentiableKokoro
 from core.perceptual_loss import (
     F0_DENSE_QUANTILES,
     FRAME_HOP,
     KOKORO_SR,
     WavLMPooledLoss,
+    internal_voiced_mask,
     duration_floor_loss,
-    energy_dynamics_loss,
-    energy_reference_cv,
-    estimate_pitch_range,
+    energy_range_loss,
+    energy_range_reference,
+    energy_sign_loss,
+    noise_floor_loss,
+    noise_floor_of,
+    NOISE_FLOOR_MARGIN_DB,
+    duration_spread_loss,
+    f0_contour_loss,
+    f0_contour_reference,
     creak_fraction_loss,
     creak_reference_fraction,
+    pause_share_loss,
+    punctuation_duration_loss,
+    declination_loss,
+    declination_reference,
     f0_distribution_loss,
     voiced_threshold_for,
     f0_reference_distribution,
@@ -92,6 +103,23 @@ TRAIN_TEXTS = [
 ]
 
 HELD_OUT_TEXT = "She sells seashells by the seashore on a bright summer day."
+
+# A multi-sentence passage used only for duration constraints, never rendered.
+# Kokoro indexes its style pack by phoneme count, and beyond the trained rows the
+# prosody profile is held flat (see StyleParameterization.voice). Those rows
+# encode length-appropriate pacing, so freezing a 100-phoneme row and using it
+# for a 400-phoneme utterance hands a long passage a short passage's pause
+# structure — measured as sentence breaks 30-39% shorter than the base voice,
+# heard as rushing. Constraining durations here costs almost nothing because the
+# vocoder never runs.
+LONG_PACING_TEXT = (
+    "The morning after the storm, the whole village came down to the water to "
+    "see what had washed in, and nobody wanted to be first to speak. There were "
+    "crates from a ship nobody recognized, half buried in the sand, and a long "
+    "stretch of rope that ran out past the breakers. She had never seen the "
+    "ocean look like that before, flat and grey and patient, as though it were "
+    "waiting to be asked a question."
+)
 
 
 def log(msg: str) -> None:
@@ -254,12 +282,20 @@ def invert(
     f0_target: list[float] | None = None,
     pitch_band: tuple[float, float] = (50.0, 400.0),
     f0_weight: float = 0.0,
+    contour_target: tuple[float, float] | None = None,
+    contour_weight: float = 0.0,
     creak_target: tuple[float, float] | None = None,
     creak_weight: float = 0.0,
+    declination_target: float | None = None,
+    declination_weight: float = 0.0,
     energy_target: float | None = None,
     energy_weight: float = 0.0,
     duration_weight: float = 0.0,
     duration_min_frames: float = 2.0,
+    pause_weight: float = 0.0,
+    duration_spread_weight: float = 0.0,
+    noise_floor_weight: float = 0.0,
+    punctuation_weight: float = 0.0,
     bounds: tuple[torch.Tensor, torch.Tensor] | None = None,
     ground_truth: torch.Tensor | None = None,
     checkpoint_path: Path | None = None,
@@ -273,6 +309,90 @@ def invert(
         contexts.append((text, ps, diff.build_context(ps)))
     log(f"Training on {len(contexts)} texts, phoneme lengths: "
         f"{sorted(len(ps) for _, ps, _ in contexts)}")
+
+    # Pause share of the *starting* voice, per text. The target is where the
+    # base voice already puts its silence, not a measurement of the reference
+    # recording — see `pause_share_loss`.
+    # Duration spread of the starting voice, per text — a regularizer against
+    # flattening the rhythm to hit a speaking rate. See `duration_spread_loss`.
+    # The base voice's own noise floor on each training text, plus slack. A
+    # fixed bound is wrong: measured on a 20 s sample the stock voices read -46
+    # to -71 dB, but on these 2-6 s training utterances the same voices sit at
+    # -75 to -141. v29's fixed -40 dB was 35-100 dB too lenient and the optimizer
+    # parked exactly on it.
+    # Base-voice duration for each punctuation class, per text. Sentence breaks
+    # and commas are kept apart on purpose — see `punctuation_duration_loss`.
+    punctuation_targets = {}
+    long_ctx = None
+    if punctuation_weight > 0:
+        # The defect appears past the trained rows, so constrain a long passage
+        # too. Duration-only, so no vocoder and no meaningful memory cost.
+        long_ps = diff.phonemize(pipeline, LONG_PACING_TEXT)
+        long_ctx = diff.build_context(long_ps)
+        long_row = len(long_ps)
+        with torch.no_grad():
+            base_long = diff.forward(long_ctx, params.base[long_row - 1].unsqueeze(0),
+                                     decode=False)
+        dl = base_long.duration.squeeze()
+        long_targets = []
+        for m in (long_ctx.sentence_mask, long_ctx.comma_mask):
+            mm = m[:dl.numel()]
+            if int(mm.sum()):
+                long_targets.append((m, float(dl[mm].mean())))
+        sp = dl[long_ctx.phoneme_mask[:dl.numel()]]
+        long_spread = float(sp.std() / sp.mean().clamp(min=1e-6))
+        log(f"Long-passage anchor: row {long_row}, base sentence break "
+            f"{long_targets[0][1] * 600 / KOKORO_SR * 1000:.0f}ms, spread {long_spread:.2f}")
+        for text, ps, ctx in contexts:
+            torch.manual_seed(SEED)
+            with torch.no_grad():
+                base_out = diff.forward(ctx, params.base[len(ps) - 1].unsqueeze(0))
+            d = base_out.duration.squeeze()
+            entry = []
+            for m in (ctx.sentence_mask, ctx.comma_mask):
+                mm = m[:d.numel()]
+                if int(mm.sum()):
+                    entry.append((m, float(d[mm].mean())))
+            punctuation_targets[text] = entry
+        shown = [f"{t * 600 / KOKORO_SR * 1000:.0f}ms"
+                 for e in punctuation_targets.values() for _, t in e]
+        log("Punctuation length in the base voice: " + ", ".join(shown))
+
+    noise_floor_bounds = {}
+    if noise_floor_weight > 0:
+        for text, ps, ctx in contexts:
+            torch.manual_seed(SEED)
+            with torch.no_grad():
+                base_out = diff.forward(ctx, params.base[len(ps) - 1].unsqueeze(0))
+            noise_floor_bounds[text] = noise_floor_of(base_out.audio) + NOISE_FLOOR_MARGIN_DB
+        log("Noise-floor bound from the base voice: "
+            + ", ".join(f"{v:.0f}dB" for v in noise_floor_bounds.values()))
+
+    duration_spread_targets = {}
+    if duration_spread_weight > 0:
+        for text, ps, ctx in contexts:
+            torch.manual_seed(SEED)
+            with torch.no_grad():
+                base_out = diff.forward(ctx, params.base[len(ps) - 1].unsqueeze(0))
+            d = base_out.duration.squeeze()
+            m = ctx.phoneme_mask[:d.numel()]
+            sp = d[m]
+            duration_spread_targets[text] = float(sp.std() / sp.mean().clamp(min=1e-6))
+        log("Duration spread of the base voice: "
+            + ", ".join(f"{v:.2f}" for v in duration_spread_targets.values()))
+
+    pause_targets = {}
+    if pause_weight > 0:
+        for text, ps, ctx in contexts:
+            torch.manual_seed(SEED)
+            with torch.no_grad():
+                d = params.base[len(ps) - 1].unsqueeze(0)
+                base_out = diff.forward(ctx, d)
+            dur = base_out.duration.squeeze()
+            pm = ctx.pause_mask[:dur.numel()]
+            pause_targets[text] = float(dur[pm].sum() / dur.sum()) if int(pm.sum()) else 0.0
+        log("Pause share of the base voice: "
+            + ", ".join(f"{100*v:.0f}%" for v in pause_targets.values()))
 
     opt = torch.optim.Adam(params.parameters(), lr=lr)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=40, factor=0.5)
@@ -330,16 +450,18 @@ def invert(
             with torch.no_grad():
                 out = diff.forward(ctx, params.row(len(ps)))
             f0 = out.f0_pred.squeeze()
-            v = f0[f0 > voiced_cut]
+            v = f0[internal_voiced_mask(f0, voiced_cut)]
             if v.numel() < 8:
                 continue
             internal = np.quantile(np.log(v.detach().cpu().numpy()), F0_DENSE_QUANTILES)
-            y = librosa.yin(out.audio.detach().cpu().numpy(),
-                            fmin=pitch_band[0], fmax=pitch_band[1], sr=KOKORO_SR)
-            voiced = y[(y > pitch_band[0] * 1.02) & (y < pitch_band[1] * 0.98)]
-            if len(voiced) < 10:
+            # Same tracker as the target, or the correction absorbs the
+            # difference between two trackers instead of the difference between
+            # internal and rendered pitch. Calibrating against yin was feeding
+            # the octave errors this whole change exists to remove.
+            rendered_track = pitch.track(out.audio.detach().cpu().numpy(), KOKORO_SR)
+            if rendered_track.voiced.sum() < 10:
                 continue
-            rendered = np.quantile(np.log(voiced), F0_DENSE_QUANTILES)
+            rendered = np.quantile(np.log(rendered_track.values), F0_DENSE_QUANTILES)
             rows.append(internal - rendered)
         if not rows:
             return
@@ -358,7 +480,7 @@ def invert(
         # the shared objective. Accumulating over all texts makes each step a
         # genuine descent direction.
         opt.zero_grad()
-        totals = {"perceptual": 0.0, "pacing": 0.0, "speaker": 0.0, "f0": 0.0, "creak": 0.0, "energy": 0.0, "dur": 0.0}
+        totals = {"perceptual": 0.0, "pacing": 0.0, "speaker": 0.0, "f0": 0.0, "contour": 0.0, "creak": 0.0, "declination": 0.0, "pause": 0.0, "durspread": 0.0, "floor": 0.0, "punct": 0.0, "energy": 0.0, "dur": 0.0}
         total_loss = 0.0
 
         for text, ps, ctx in contexts:
@@ -405,15 +527,51 @@ def invert(
                 loss = loss + f0_weight * lf
                 totals["f0"] += float(lf)
 
+            if contour_target is not None and contour_weight > 0:
+                lct = f0_contour_loss(out.f0_pred, contour_target, voiced_cut)
+                loss = loss + contour_weight * lct
+                totals["contour"] += float(lct)
+
             if creak_target is not None and creak_weight > 0:
                 lc = creak_fraction_loss(out.f0_pred, creak_target[0], creak_target[1])
                 loss = loss + creak_weight * lc
                 totals["creak"] += float(lc)
 
+            if pause_weight > 0 and text in pause_targets:
+                lpa = pause_share_loss(out.duration, ctx.pause_mask,
+                                       pause_targets[text])
+                loss = loss + pause_weight * lpa
+                totals["pause"] += float(lpa)
+
+            if declination_target is not None and declination_weight > 0:
+                ldec = declination_loss(out.f0_pred, declination_target, voiced_cut)
+                loss = loss + declination_weight * ldec
+                totals["declination"] += float(ldec)
+
             if energy_target is not None and energy_weight > 0:
-                le = energy_dynamics_loss(out.n_pred, energy_target)
+                # Deadband on how much loudness moves, plus a barrier against
+                # the internal energy contour inverting. Both are zero on a
+                # healthy voice, so neither can perturb one that is already right.
+                le = (energy_range_loss(out.audio, energy_target)
+                      + energy_sign_loss(out.n_pred))
                 loss = loss + energy_weight * le
                 totals["energy"] += float(le)
+
+            if punctuation_weight > 0 and punctuation_targets.get(text):
+                lpn = punctuation_duration_loss(out.duration, punctuation_targets[text])
+                loss = loss + punctuation_weight * lpn
+                totals["punct"] += float(lpn)
+
+            if noise_floor_weight > 0 and text in noise_floor_bounds:
+                lnf = noise_floor_loss(out.audio, noise_floor_bounds[text])
+                loss = loss + noise_floor_weight * lnf
+                totals["floor"] += float(lnf)
+
+            if duration_spread_weight > 0 and text in duration_spread_targets:
+                lds = duration_spread_loss(out.duration, ctx.phoneme_mask,
+                                           duration_spread_targets[text])
+                loss = loss + duration_spread_weight * lds
+                totals["durspread"] += float(lds)
 
             # Lengthen phonemes Kokoro swallows, without slowing everything.
             if duration_weight > 0:
@@ -433,6 +591,19 @@ def invert(
             reg = manifold_penalty(params.voice(), bounds[0], bounds[1])
             (reg_weight * reg).backward()
             totals["reg"] = float(reg) * len(contexts)
+
+        # Duration constraints at a long utterance length — once per step, not
+        # per text, and backwarded on its own like the manifold penalty. The
+        # defect lives past the trained rows, so it has to be measured there.
+        # `decode=False` skips the vocoder, which is where the memory goes.
+        if punctuation_weight > 0 and long_ctx is not None:
+            lo = diff.forward(long_ctx, params.row(len(long_ctx.phonemes)),
+                              decode=False)
+            llp = (punctuation_duration_loss(lo.duration, long_targets)
+                   + duration_spread_loss(lo.duration, long_ctx.phoneme_mask,
+                                          long_spread))
+            (punctuation_weight * llp).backward()
+            totals["punct"] += float(llp) * len(contexts)
 
         torch.nn.utils.clip_grad_norm_(params.parameters(), 1.0)
         opt.step()
@@ -483,9 +654,30 @@ def main() -> int:
     # Was 0.1 against a pitch weight of 5.0, i.e. fifty times weaker, which left
     # speaking rate effectively unconstrained.
     ap.add_argument("--pacing-weight", type=float, default=2.0)
+    ap.add_argument("--max-clip-seconds", type=float, default=10.0,
+                    help="Refuse training clips longer than this. Peak memory is "
+                         "roughly 0.75GB per second of audio, so a 15s clip needs "
+                         "~11GB and will be killed by the OS mid-run.")
+    ap.add_argument("--contour-weight", type=float, default=0.0,
+                    help="Weight on matching frame-to-frame pitch movement — the "
+                         "melody rather than the pitch histogram")
     ap.add_argument("--creak-weight", type=float, default=0.0,
-                    help="Weight on matching how much of the voice sits in creak "
-                         "below the register")
+                    help="Weight on keeping creak below the reference's own share "
+                         "of frames under the register")
+    ap.add_argument("--declination-weight", type=float, default=0.0,
+                    help="Weight on matching how fast pitch falls across a phrase "
+                         "(unreliable target -- see core/pitch.py)")
+    ap.add_argument("--duration-spread-weight", type=float, default=0.0,
+                    help="Weight on keeping phoneme-length variation where the "
+                         "base voice had it")
+    ap.add_argument("--punctuation-weight", type=float, default=0.0,
+                    help="Weight on keeping pauses at punctuation as long as the "
+                         "base voice made them")
+    ap.add_argument("--noise-floor-weight", type=float, default=0.0,
+                    help="Weight on keeping the gaps between words quiet")
+    ap.add_argument("--pause-weight", type=float, default=0.0,
+                    help="Weight on keeping the share of time spent in pauses "
+                         "where the base voice had it")
     ap.add_argument("--energy-weight", type=float, default=0.0,
                     help="Weight on matching how much loudness varies")
     ap.add_argument("--speaker-weight", type=float, default=0.0,
@@ -569,10 +761,31 @@ def main() -> int:
         target_audio = []
         target_rates = {}
         clips = []
-        for path in args.target:
+        # Peak memory scales linearly with clip length — measured ~0.75GB per
+        # second of audio, since the backward pass retains activations through
+        # Kokoro's vocoder at 24kHz. A 14.6s clip needs ~11GB and gets killed by
+        # the OS mid-run, which looks like an unexplained disappearance rather
+        # than an error. Refuse it up front instead.
+        keep_targets, keep_texts, skipped = [], [], []
+        texts = args.target_text or [None] * len(args.target)
+        for path, text in zip(args.target, texts):
             audio, _ = librosa.load(path, sr=KOKORO_SR, mono=True)
+            seconds = len(audio) / KOKORO_SR
+            if seconds > args.max_clip_seconds:
+                skipped.append((Path(path).name, seconds))
+                continue
             clips.append(torch.from_numpy(audio).float().to(args.device))
-            log(f"  target: {Path(path).name}  {len(audio)/KOKORO_SR:.1f}s")
+            keep_targets.append(path)
+            keep_texts.append(text)
+            log(f"  target: {Path(path).name}  {seconds:.1f}s")
+        for name, sec in skipped:
+            log(f"  SKIPPED {name} ({sec:.1f}s): over --max-clip-seconds "
+                f"({args.max_clip_seconds:.0f}s, would need ~{sec*0.75:.1f}GB)")
+        args.target = keep_targets
+        if args.target_text:
+            args.target_text = keep_texts
+        if not clips:
+            ap.error("no clips left after the length filter; raise --max-clip-seconds")
 
         if args.target_text:
             # Each clip is paired with its own transcript, by position. Pooled
@@ -676,30 +889,47 @@ def main() -> int:
             log(f"F0 target from {Path(args.f0_reference).name} (full recording)")
         else:
             ref = np.concatenate([a.detach().cpu().numpy() for a in target_audio])
-        pitch_band = estimate_pitch_range(ref)
-        log(f"Pitch analysis band from reference: "
-            f"{pitch_band[0]:.0f}-{pitch_band[1]:.0f} Hz")
+        ref_track = pitch.track(ref, KOKORO_SR)
+        pitch_band = ref_track.band()
+        log(f"Pitch tracked by {ref_track.tracker}: register "
+            f"{ref_track.register():.0f} Hz, {100*ref_track.voiced.mean():.0f}% of "
+            f"frames voiced, band {pitch_band[0]:.0f}-{pitch_band[1]:.0f} Hz")
         f0_target = f0_reference_distribution(ref, band=pitch_band)
         log(f"Voiced cut: {voiced_threshold_for(f0_target):.0f} Hz "
-            f"(scaled to this speaker)")
+            f"(below this speaker's lowest real pitch)")
         log(f"F0 target: {len(f0_target)}-level distribution, "
             + " ".join(f"{np.exp(f0_target[i]):.0f}" for i in (0, 6, 12, 18, 24))
             + " Hz at p2/p26/p50/p74/p98")
+
+    contour_target = None
+    if args.contour_weight > 0 and args.f0_reference:
+        ref_ct, _ = librosa.load(args.f0_reference, sr=KOKORO_SR, mono=True)
+        contour_target = f0_contour_reference(ref_ct, band=pitch_band)
+        log(f"Contour target: {contour_target[0]:.4f} per 12.5ms frame, "
+            f"{contour_target[1]:.4f} per 150ms syllable "
+            f"(ratio {contour_target[1] / max(contour_target[0], 1e-6):.1f})")
 
     creak_target = None
     if args.creak_weight > 0 and args.f0_reference:
         ref_c, _ = librosa.load(args.f0_reference, sr=KOKORO_SR, mono=True)
         creak_target = creak_reference_fraction(ref_c, band=pitch_band)
-        log(f"Creak target: {100*creak_target[0]:.0f}% of frames below "
+        log(f"Creak target: {100*creak_target[0]:.1f}% of frames below "
             f"{creak_target[1]:.0f} Hz")
+
+    declination_target = None
+    if args.declination_weight > 0 and args.f0_reference:
+        ref_d, _ = librosa.load(args.f0_reference, sr=KOKORO_SR, mono=True)
+        declination_target = declination_reference(ref_d)
+        log(f"Declination target: {declination_target:+.3f} log-units of pitch "
+            f"per second within a phrase")
 
     energy_target = None
     if args.energy_weight > 0:
         ref_e = (librosa.load(args.f0_reference, sr=KOKORO_SR, mono=True)[0]
                  if args.f0_reference
                  else np.concatenate([a.detach().cpu().numpy() for a in target_audio]))
-        energy_target = energy_reference_cv(ref_e)
-        log(f"Energy variation target (coefficient of variation): {energy_target:.3f}")
+        energy_target = energy_range_reference(ref_e)
+        log(f"Energy range target: {energy_target:.2f} dB spread of frame level")
 
     bounds = None
     if args.reg_weight > 0:
@@ -735,8 +965,16 @@ def main() -> int:
         f0_target=f0_target,
         f0_weight=args.f0_weight,
         pitch_band=pitch_band,
+        contour_target=contour_target,
+        contour_weight=args.contour_weight,
         creak_target=creak_target,
         creak_weight=args.creak_weight,
+        declination_target=declination_target,
+        declination_weight=args.declination_weight,
+        pause_weight=args.pause_weight,
+        duration_spread_weight=args.duration_spread_weight,
+        noise_floor_weight=args.noise_floor_weight,
+        punctuation_weight=args.punctuation_weight,
         energy_target=energy_target,
         energy_weight=args.energy_weight,
         duration_weight=args.duration_weight,

@@ -46,6 +46,15 @@ class TextContext:
     # spaces, punctuation and the BOS/EOS tokens legitimately get ~1 frame, so
     # any duration constraint has to exclude them.
     phoneme_mask: torch.Tensor
+    # True at the tokens that become silence — spaces and punctuation. Stress
+    # marks are excluded: they are not pauses.
+    pause_mask: torch.Tensor
+    # Punctuation split by strength. Kept separate because they behave
+    # differently and averaging them hides the signal: one measured passage has
+    # 82 spaces against 3 sentence ends, so a pooled "pause share" is dominated
+    # by spaces and misses a 30% compression of the sentence breaks entirely.
+    sentence_mask: torch.Tensor
+    comma_mask: torch.Tensor
 
 
 @dataclass
@@ -101,10 +110,24 @@ class DifferentiableKokoro:
         # Token layout is [BOS, *phonemes, EOS], so index i+1 corresponds to
         # phonemes[i].
         non_speech = set(" ˈˌ,.;:!?…\"'()-")
+        pauses = set(" ,.;:!?…")
+        sentence_end = set(".!?…")
+        commas = set(",;:")
         mask = torch.zeros(input_ids.shape[1], dtype=torch.bool, device=self.device)
+        pause_mask = torch.zeros_like(mask)
+        sentence_mask = torch.zeros_like(mask)
+        comma_mask = torch.zeros_like(mask)
         for i, ch in enumerate(phonemes):
-            if i + 1 < mask.shape[0] and ch not in non_speech:
+            if i + 1 >= mask.shape[0]:
+                continue
+            if ch not in non_speech:
                 mask[i + 1] = True
+            elif ch in pauses:
+                pause_mask[i + 1] = True
+                if ch in sentence_end:
+                    sentence_mask[i + 1] = True
+                elif ch in commas:
+                    comma_mask[i + 1] = True
 
         return TextContext(
             input_ids=input_ids,
@@ -114,6 +137,9 @@ class DifferentiableKokoro:
             t_en=t_en,
             phonemes=phonemes,
             phoneme_mask=mask,
+            pause_mask=pause_mask,
+            sentence_mask=sentence_mask,
+            comma_mask=comma_mask,
         )
 
     # -- style side ----------------------------------------------------------
@@ -123,11 +149,19 @@ class DifferentiableKokoro:
         ctx: TextContext,
         ref_s: torch.Tensor,
         speed: float = 1.0,
+        decode: bool = True,
     ) -> DiffOutput:
         """Grad-enabled equivalent of `KModel.forward_with_tokens`.
 
         `ref_s` is [1, 256] and may require grad; everything returned in
         `DiffOutput` except `pred_dur` stays attached to it.
+
+        `decode=False` stops before the vocoder and returns `audio=None`. Peak
+        memory in the backward pass is dominated by retained vocoder activations
+        at 24 kHz — roughly 0.75 GB per second of audio — so duration-only
+        constraints can be applied at utterance lengths that would be far too
+        expensive to render. `duration` is produced before the decoder and is
+        unaffected.
         """
         predictor = self.model.predictor
         ref_s = ref_s.to(self.device)
@@ -152,6 +186,10 @@ class DifferentiableKokoro:
         )
         pred_aln_trg[indices, torch.arange(indices.shape[0])] = 1
         pred_aln_trg = pred_aln_trg.unsqueeze(0)
+
+        if not decode:
+            return DiffOutput(audio=None, duration=duration, pred_dur=pred_dur,
+                              f0_pred=None, n_pred=None)
 
         en = d.transpose(-1, -2) @ pred_aln_trg
         f0_pred, n_pred = predictor.F0Ntrain(en, s)
