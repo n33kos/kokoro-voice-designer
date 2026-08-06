@@ -455,17 +455,27 @@ def subharmonic_energy(audio: torch.Tensor, f0_hz: float,
     irregularity; it is genuine energy under the fundamental.
 
     Differentiable through `torch.stft`, so it can be applied to rendered audio.
+
+    **Resolution matters more than it looks.** A first attempt used a 2048-point
+    transform, giving 11.7 Hz bins. For a 90 Hz speaker the band below
+    `0.75 x f0` is then about six bins wide and is dominated by spectral leakage
+    from the fundamental itself plus DC rumble, not by subharmonics. Measured
+    that way, a real speaker read 1.17% and the voice fitted to him 1.19% — no
+    separation at all — while a clean stock voice read 15.75%, which is not
+    physically plausible. A 8192-point transform (2.9 Hz bins) with a 40 Hz
+    high-pass to drop rumble is what actually resolves the region.
     """
     x = audio.squeeze()
-    n_fft = 2048
+    n_fft = 8192
     if x.numel() < n_fft:
         return x.sum() * 0.0
     window = torch.hann_window(n_fft, device=x.device, dtype=x.dtype)
-    spec = torch.stft(x, n_fft=n_fft, hop_length=512, window=window,
+    spec = torch.stft(x, n_fft=n_fft, hop_length=1024, window=window,
                       return_complex=True).abs()
     freqs = torch.linspace(0, sr / 2, spec.shape[0], device=x.device, dtype=x.dtype)
-    below = spec[freqs < f0_hz * 0.75].sum()
-    total = spec[freqs < 4000.0].sum().clamp(min=1e-9)
+    band = (freqs > 40.0) & (freqs < f0_hz * 0.75)
+    below = spec[band].sum()
+    total = spec[(freqs > 40.0) & (freqs < 4000.0)].sum().clamp(min=1e-9)
     return below / total
 
 
