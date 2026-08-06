@@ -157,6 +157,54 @@ def estimate_pitch_range(audio: np.ndarray, sr: int = KOKORO_SR) -> tuple[float,
 F0_DENSE_QUANTILES = tuple(round(0.02 + 0.96 * i / 24, 4) for i in range(25))
 
 
+F0_RANGE_LEVELS = (0.90, 0.94, 0.98)
+
+
+def f0_range_loss(f0_pred: torch.Tensor, target: list[float],
+                  offset: list[float] | None = None,
+                  voiced_threshold: float | None = None,
+                  tolerance: float = 0.03) -> torch.Tensor:
+    """Stop the top of the pitch range being compressed.
+
+    Two voices came out with p90 **reproducibly ~10% low across independent
+    runs** while their medians were within a few percent. Averaging the runs did
+    not reduce it, so it is a bias rather than scatter: emphasis simply does not
+    reach high enough.
+
+    `f0_distribution_loss` cannot see it. It averages squared error over 25
+    quantile levels, so a 10% miss at p90 contributes (ln 1.10)^2 / 25 = 0.0004 —
+    nothing beside the other terms. Weighting the tails inside that mean barely
+    helps either, because normalising by the weights cancels most of the gain
+    (0.00047 against 0.00036). The tail needs its own term.
+
+    **One-sided.** Only a range that is too *narrow* costs anything; overshooting
+    is free, and is anyway covered by the distribution match. So this is silent
+    on voices whose upper range is already right and pulls only the compressed
+    ones. `tolerance` is a 3% deadband, well inside the ~5% run-to-run scatter
+    measured between two runs with identical settings.
+    """
+    if voiced_threshold is None:
+        voiced_threshold = voiced_threshold_for(target)
+    f0 = f0_pred.squeeze()
+    voiced = f0[internal_voiced_mask(f0, voiced_threshold)]
+    if voiced.numel() < 8:
+        return f0.sum() * 0.0
+    log_f0 = torch.log(voiced.clamp(min=1.0))
+    want_all = np.asarray(target, dtype=np.float64)
+    if offset is not None:
+        want_all = want_all + np.asarray(offset, dtype=np.float64)
+    levels, wants = [], []
+    for lv in F0_RANGE_LEVELS:
+        i = int(np.argmin(np.abs(np.asarray(F0_DENSE_QUANTILES) - lv)))
+        levels.append(F0_DENSE_QUANTILES[i])
+        wants.append(float(want_all[i]))
+    qs = torch.tensor(levels, device=f0.device, dtype=log_f0.dtype)
+    got = torch.quantile(log_f0, qs)
+    want = torch.tensor(wants, device=f0.device, dtype=log_f0.dtype)
+    shortfall = (want - got - tolerance).clamp(min=0.0)
+    return (shortfall ** 2).mean()
+
+
 def f0_reference_distribution(audio: np.ndarray, sr: int = KOKORO_SR,
                               band: tuple[float, float] | None = None) -> list[float]:
     """Densely sampled log-F0 quantiles — the distribution-matching target."""
@@ -535,7 +583,8 @@ def declination_reference(audio: np.ndarray, sr: int = KOKORO_SR) -> float:
 
 def f0_distribution_loss(f0_pred: torch.Tensor, target: list[float],
                          offset: list[float] | None = None,
-                         voiced_threshold: float | None = None) -> torch.Tensor:
+                         voiced_threshold: float | None = None,
+                         tail_emphasis: float = 2.0) -> torch.Tensor:
     """Match the whole log-F0 distribution, not five points on it.
 
     Equivalent to a quantile-function (inverse-CDF) distance: comparing sorted
@@ -546,6 +595,15 @@ def f0_distribution_loss(f0_pred: torch.Tensor, target: list[float],
     F0_pred and pitch measured on rendered audio. That gap is a stretch, not a
     shift — measured 0.68x at the bottom of the distribution and 1.09x at the
     top — so it must be applied per level.
+
+    **The tails are weighted up.** A flat mean over 25 levels cannot feel a tail
+    error: a 10% miss at p90 contributes (ln 1.10)^2 / 25 = 0.0004, which is
+    nothing beside the other terms. Two voices came out with p90 reproducibly
+    ~10% low across independent runs — a bias, not scatter, since averaging runs
+    did not reduce it — while their medians were within a few percent. That is
+    the signature of a loss that nails the middle and cannot see the edges.
+    `tail_emphasis` scales each level by 1 + tail_emphasis * |2q - 1|, so the
+    extremes count roughly three times the median.
     """
     if voiced_threshold is None:
         voiced_threshold = voiced_threshold_for(target)
@@ -559,7 +617,8 @@ def f0_distribution_loss(f0_pred: torch.Tensor, target: list[float],
     want = torch.tensor(target, device=f0.device, dtype=log_f0.dtype)
     if offset is not None:
         want = want + torch.tensor(offset, device=f0.device, dtype=log_f0.dtype)
-    return ((got - want) ** 2).mean()
+    w = 1.0 + tail_emphasis * (2.0 * qs - 1.0).abs()
+    return (((got - want) ** 2) * w).sum() / w.sum()
 
 
 def energy_reference_cv(audio: np.ndarray, sr: int = KOKORO_SR) -> float:

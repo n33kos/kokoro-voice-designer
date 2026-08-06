@@ -69,6 +69,7 @@ from core.perceptual_loss import (
     declination_loss,
     declination_reference,
     f0_distribution_loss,
+    f0_range_loss,
     voiced_threshold_for,
     f0_reference_distribution,
     pacing_loss,
@@ -285,6 +286,7 @@ def invert(
     f0_target: list[float] | None = None,
     pitch_band: tuple[float, float] = (50.0, 400.0),
     f0_weight: float = 0.0,
+    f0_range_weight: float = 0.0,
     contour_target: tuple[float, float] | None = None,
     contour_weight: float = 0.0,
     creak_target: tuple[float, float] | None = None,
@@ -488,7 +490,7 @@ def invert(
         # the shared objective. Accumulating over all texts makes each step a
         # genuine descent direction.
         opt.zero_grad()
-        totals = {"perceptual": 0.0, "pacing": 0.0, "speaker": 0.0, "f0": 0.0, "contour": 0.0, "creak": 0.0, "declination": 0.0, "pause": 0.0, "durspread": 0.0, "floor": 0.0, "punct": 0.0, "subharm": 0.0, "energy": 0.0, "dur": 0.0}
+        totals = {"perceptual": 0.0, "pacing": 0.0, "speaker": 0.0, "f0": 0.0, "f0range": 0.0, "contour": 0.0, "creak": 0.0, "declination": 0.0, "pause": 0.0, "durspread": 0.0, "floor": 0.0, "punct": 0.0, "subharm": 0.0, "energy": 0.0, "dur": 0.0}
         total_loss = 0.0
 
         for text, ps, ctx in contexts:
@@ -534,6 +536,11 @@ def invert(
                 lf = f0_distribution_loss(out.f0_pred, f0_target, offset=f0_offset)
                 loss = loss + f0_weight * lf
                 totals["f0"] += float(lf)
+
+                # The distribution mean cannot feel a tail error; this can.
+                lr = f0_range_loss(out.f0_pred, f0_target, offset=f0_offset)
+                loss = loss + f0_range_weight * lr
+                totals["f0range"] += float(lr)
 
             if contour_target is not None and contour_weight > 0:
                 lct = f0_contour_loss(out.f0_pred, contour_target, voiced_cut)
@@ -686,6 +693,9 @@ def main() -> int:
     ap.add_argument("--duration-spread-weight", type=float, default=0.0,
                     help="Weight on keeping phoneme-length variation where the "
                          "base voice had it")
+    ap.add_argument("--f0-range-weight", type=float, default=0.0,
+                    help="Weight on keeping the top of the pitch range from "
+                         "being compressed")
     ap.add_argument("--subharmonic-weight", type=float, default=0.0,
                     help="Weight on keeping energy below the fundamental down "
                          "(low-frequency graininess)")
@@ -994,6 +1004,7 @@ def main() -> int:
         speaker_weight=args.speaker_weight,
         f0_target=f0_target,
         f0_weight=args.f0_weight,
+        f0_range_weight=args.f0_range_weight,
         pitch_band=pitch_band,
         contour_target=contour_target,
         contour_weight=args.contour_weight,
