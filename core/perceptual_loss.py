@@ -205,6 +205,75 @@ def f0_range_loss(f0_pred: torch.Tensor, target: list[float],
     return (shortfall ** 2).mean()
 
 
+TREMOR_LO_HZ, TREMOR_HI_HZ = 3.0, 10.0
+TREMOR_TOTAL_LO, TREMOR_TOTAL_HI = 0.5, 20.0
+
+
+def _contour_rate(sr: int = KOKORO_SR) -> float:
+    """Sample rate of Kokoro's internal F0 contour, in Hz."""
+    return sr / pitch.INTERNAL_HOP
+
+
+def tremor_share(f0_pred: torch.Tensor, voiced_threshold: float,
+                 sr: int = KOKORO_SR) -> torch.Tensor:
+    """Share of pitch modulation sitting in the 3-10 Hz tremor band.
+
+    A steady wobble through the voice is periodic modulation of pitch at a few
+    Hz. **Nothing else here can see it**: `creak_fraction_loss` counts frames
+    below a threshold and a tremor sits at the median; `f0_contour_loss`
+    constrains how far pitch moves per frame and per syllable, which a wobble
+    satisfies as well as melody does.
+
+    Measured against the references, it tracks the listening verdict on every
+    voice tested: one fitted voice at 9.2% against its speaker's 5.4% was
+    reported as "a constant vibration crackliness all the way through", while two
+    others at 3.4% and 6.3% against 4.6% and 7.5% were reported as sounding good.
+    It also rose 6.2% -> 9.2% over the two versions where the listener said that
+    voice got worse, while every pitch quantile was improving.
+
+    Computed on the internal contour, which is already sampled at 80 Hz, so no
+    tracker and no alignment are involved. Unvoiced frames are held at the voiced
+    mean rather than interpolated, keeping it differentiable.
+    """
+    f0 = f0_pred.squeeze()
+    if f0.numel() < 64:
+        return f0.sum() * 0.0
+    voiced = internal_voiced_mask(f0, voiced_threshold)
+    if int(voiced.sum()) < 32:
+        return f0.sum() * 0.0
+    lg = torch.log(f0.clamp(min=1.0))
+    filled = torch.where(voiced, lg, lg[voiced].mean())
+    x = filled - filled.mean()
+    spec = torch.fft.rfft(x).abs() ** 2
+    freqs = torch.fft.rfftfreq(x.numel(), d=1.0 / _contour_rate(sr)).to(x.device)
+    band = (freqs > TREMOR_LO_HZ) & (freqs < TREMOR_HI_HZ)
+    total = (freqs > TREMOR_TOTAL_LO) & (freqs < TREMOR_TOTAL_HI)
+    return spec[band].sum() / spec[total].sum().clamp(min=1e-12)
+
+
+def tremor_reference(audio: np.ndarray, sr: int = KOKORO_SR) -> float:
+    """The same share, measured on a reference recording's tracked pitch."""
+    track = pitch.track(audio, sr)
+    if track.voiced.sum() < 64:
+        return 0.0
+    lg = np.log(np.clip(track.f0, 1.0, None))
+    idx = np.arange(len(lg))
+    lg = np.interp(idx, idx[track.voiced], lg[track.voiced])
+    x = lg - lg.mean()
+    spec = np.abs(np.fft.rfft(x)) ** 2
+    freqs = np.fft.rfftfreq(len(x), d=track.hop_seconds)
+    band = (freqs > TREMOR_LO_HZ) & (freqs < TREMOR_HI_HZ)
+    total = (freqs > TREMOR_TOTAL_LO) & (freqs < TREMOR_TOTAL_HI)
+    return float(spec[band].sum() / max(spec[total].sum(), 1e-12))
+
+
+def tremor_loss(f0_pred: torch.Tensor, max_share: float,
+                voiced_threshold: float, sr: int = KOKORO_SR) -> torch.Tensor:
+    """Hinge on tremor. Free up to `max_share`; less wobble is never penalised."""
+    share = tremor_share(f0_pred, voiced_threshold, sr)
+    return ((share - max_share).clamp(min=0.0) / max(max_share, 1e-6)) ** 2
+
+
 def f0_reference_distribution(audio: np.ndarray, sr: int = KOKORO_SR,
                               band: tuple[float, float] | None = None) -> list[float]:
     """Densely sampled log-F0 quantiles — the distribution-matching target."""
@@ -444,8 +513,21 @@ def punctuation_duration_loss(duration: torch.Tensor,
     dominated by spaces, which do not move. **Classes that behave differently
     have to be measured separately or the signal averages away.**
 
-    One-sided against the base voice's own duration for each class: shortening a
-    break costs, lengthening one is free. Zero when the voice is already right.
+    One-sided against a target duration for each class: shortening a break costs,
+    lengthening one is free.
+
+    **The target is the base voice's duration scaled toward the real speaker.**
+    Targeting the base voice alone cannot reach: measured as silent gaps in the
+    recordings, the real speakers pause 525 / 438 / 288 / 225 ms at the median
+    while the stock voices they start from pause 325 / 412 / 412 / 475, and the
+    fitted voices ended at 319 / 238 / 188 / 175 — every one 22-46% short of its
+    speaker, and two of them short of a base voice that was itself short. A
+    listener called it out on all four at once: "they all need to pause more
+    after periods and commas, that feels universal."
+
+    The base voice supplies the mapping from token duration to rendered silence,
+    which is not one to one; the reference supplies the target. So callers scale
+    the base voice's token duration by (real gap / base gap).
     """
     d = duration.squeeze()
     total = d.sum() * 0.0

@@ -221,3 +221,30 @@ def track(audio: np.ndarray, sr: int = KOKORO_SR,
                         hop_seconds=hop_seconds, tracker=tracker)
     _CACHE[key] = result
     return result
+
+
+def silent_gaps(audio: np.ndarray, sr: int = KOKORO_SR,
+                floor_db: float = -35.0, min_ms: float = 120.0) -> np.ndarray:
+    """Lengths of the silent stretches in a recording, in milliseconds.
+
+    How long a speaker actually pauses. Unlike token durations this is directly
+    comparable between a reference recording and rendered audio, because it is
+    measured the same way on both and does not depend on the text.
+    """
+    import librosa
+
+    hop = INTERNAL_HOP
+    rms = librosa.feature.rms(y=audio, frame_length=4 * hop, hop_length=hop)[0]
+    db = librosa.amplitude_to_db(rms, ref=np.max(rms))
+    quiet = db < floor_db
+    runs, n = [], 0
+    for q in quiet:
+        if q:
+            n += 1
+        elif n:
+            runs.append(n)
+            n = 0
+    if n:
+        runs.append(n)
+    ms = np.asarray(runs, dtype=np.float64) * 1000.0 * hop / sr
+    return ms[ms >= min_ms]

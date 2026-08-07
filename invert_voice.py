@@ -70,6 +70,9 @@ from core.perceptual_loss import (
     declination_reference,
     f0_distribution_loss,
     f0_range_loss,
+    tremor_loss,
+    tremor_reference,
+    tremor_share,
     voiced_threshold_for,
     f0_reference_distribution,
     pacing_loss,
@@ -287,6 +290,9 @@ def invert(
     pitch_band: tuple[float, float] = (50.0, 400.0),
     f0_weight: float = 0.0,
     f0_range_weight: float = 0.0,
+    tremor_weight: float = 0.0,
+    tremor_bound: float | None = None,
+    tremor_ref_share: float | None = None,
     contour_target: tuple[float, float] | None = None,
     contour_weight: float = 0.0,
     creak_target: tuple[float, float] | None = None,
@@ -298,6 +304,8 @@ def invert(
     duration_weight: float = 0.0,
     duration_min_frames: float = 2.0,
     pause_weight: float = 0.0,
+    pause_reference: float | None = None,
+    pause_base: float | None = None,
     duration_spread_weight: float = 0.0,
     noise_floor_weight: float = 0.0,
     punctuation_weight: float = 0.0,
@@ -332,7 +340,27 @@ def invert(
     punctuation_targets = {}
     boundary_targets = {}
     long_ctx = None
+    pause_scale = 1.0
     if punctuation_weight > 0:
+        # The base voice maps token duration to rendered silence; the reference
+        # supplies the target. Targeting the base voice alone cannot reach it —
+        # measured as silent gaps, one speaker pauses 525 ms at the median while
+        # the voice fitted from his base pauses 319, and that base voice itself
+        # only manages 325. See `punctuation_duration_loss`.
+        # The base voice's own gaps, on these same training texts, measured by
+        # the identical routine used on the reference.
+        base_gaps = []
+        for text, ps, ctx in contexts:
+            torch.manual_seed(SEED)
+            with torch.no_grad():
+                bo = diff.forward(ctx, params.base[len(ps) - 1].unsqueeze(0))
+            base_gaps.extend(pitch.silent_gaps(bo.audio.detach().cpu().numpy(),
+                                               KOKORO_SR).tolist())
+        pause_base = float(np.median(base_gaps)) if len(base_gaps) >= 3 else None
+        if pause_reference is not None and pause_base:
+            pause_scale = float(np.clip(pause_reference / pause_base, 0.75, 2.5))
+            log(f"Pause scale toward the reference speaker: {pause_scale:.2f}x "
+                f"(speaker {pause_reference:.0f}ms, base voice {pause_base:.0f}ms)")
         # The defect appears past the trained rows, so constrain a long passage
         # too. Duration-only, so no vocoder and no meaningful memory cost.
         long_ps = diff.phonemize(pipeline, LONG_PACING_TEXT)
@@ -362,7 +390,7 @@ def invert(
                 mm = m[:d.numel()]
                 if int(mm.sum()):
                     entry.append((m, float(d[mm].mean())))
-            punctuation_targets[text] = entry
+            punctuation_targets[text] = [(m, t * pause_scale) for m, t in entry]
             boundary_targets[text] = float(d[0])
         shown = [f"{t * 600 / KOKORO_SR * 1000:.0f}ms"
                  for e in punctuation_targets.values() for _, t in e]
@@ -443,6 +471,31 @@ def invert(
     # subsets of frames and the correction is meaningless.
     voiced_cut = voiced_threshold_for(f0_target) if f0_target else 30.0
 
+    # The tremor bound comes from tracked pitch on a recording, but the loss
+    # reads Kokoro's internal contour, which carries much more 3-10 Hz energy
+    # because of voicing ramps — measured 42.7 against a bound of 0.06, i.e. the
+    # term was 99% of the objective. Calibrate the two on the base voice, whose
+    # internal contour and rendered audio can both be measured.
+    if tremor_weight > 0 and tremor_ref_share is not None:
+        ratios = []
+        for text, ps, ctx in contexts:
+            torch.manual_seed(SEED)
+            with torch.no_grad():
+                bo = diff.forward(ctx, params.base[len(ps) - 1].unsqueeze(0))
+            rendered = tremor_reference(bo.audio.detach().cpu().numpy(), KOKORO_SR)
+            internal = float(tremor_share(bo.f0_pred, voiced_cut))
+            if rendered > 1e-6:
+                ratios.append(internal / rendered)
+        if ratios:
+            scale = float(np.median(ratios))
+            tremor_bound = tremor_ref_share * 1.15 * scale
+            log(f"Tremor bound {100*tremor_bound:.1f}% internal "
+                f"(reference {100*tremor_ref_share:.1f}% rendered, "
+                f"internal/rendered {scale:.1f}x)")
+        else:
+            tremor_bound = None
+
+
     def recalibrate(f0_target):
         """Shift the F0 target so rendered pitch, not F0_pred, hits the mark.
 
@@ -501,7 +554,7 @@ def invert(
         # the shared objective. Accumulating over all texts makes each step a
         # genuine descent direction.
         opt.zero_grad()
-        totals = {"perceptual": 0.0, "pacing": 0.0, "speaker": 0.0, "f0": 0.0, "f0range": 0.0, "contour": 0.0, "creak": 0.0, "declination": 0.0, "pause": 0.0, "durspread": 0.0, "floor": 0.0, "punct": 0.0, "subharm": 0.0, "energy": 0.0, "dur": 0.0}
+        totals = {"perceptual": 0.0, "pacing": 0.0, "speaker": 0.0, "f0": 0.0, "f0range": 0.0, "tremor": 0.0, "contour": 0.0, "creak": 0.0, "declination": 0.0, "pause": 0.0, "durspread": 0.0, "floor": 0.0, "punct": 0.0, "subharm": 0.0, "energy": 0.0, "dur": 0.0}
         total_loss = 0.0
 
         for text, ps, ctx in contexts:
@@ -552,6 +605,11 @@ def invert(
                 lr = f0_range_loss(out.f0_pred, f0_target, offset=f0_offset)
                 loss = loss + f0_range_weight * lr
                 totals["f0range"] += float(lr)
+
+            if tremor_weight > 0 and tremor_bound is not None:
+                lt = tremor_loss(out.f0_pred, tremor_bound, voiced_cut)
+                loss = loss + tremor_weight * lt
+                totals["tremor"] += float(lt)
 
             if contour_target is not None and contour_weight > 0:
                 lct = f0_contour_loss(out.f0_pred, contour_target, voiced_cut)
@@ -704,6 +762,9 @@ def main() -> int:
     ap.add_argument("--duration-spread-weight", type=float, default=0.0,
                     help="Weight on keeping phoneme-length variation where the "
                          "base voice had it")
+    ap.add_argument("--tremor-weight", type=float, default=0.0,
+                    help="Weight on keeping 3-10 Hz pitch wobble no worse than "
+                         "the reference speaker's")
     ap.add_argument("--f0-range-weight", type=float, default=0.0,
                     help="Weight on keeping the top of the pitch range from "
                          "being compressed")
@@ -963,6 +1024,23 @@ def main() -> int:
         log(f"Declination target: {declination_target:+.3f} log-units of pitch "
             f"per second within a phrase")
 
+    # Median silent gap in the reference recording, and in the base voice on the
+    # training texts, so the punctuation target can be scaled from one to the
+    # other. Both measured by identical code.
+    pause_reference = pause_base = None
+    if args.punctuation_weight > 0 and args.f0_reference:
+        ref_p, _ = librosa.load(args.f0_reference, sr=KOKORO_SR, mono=True)
+        gaps = pitch.silent_gaps(ref_p, KOKORO_SR)
+        if len(gaps) >= 3:
+            pause_reference = float(np.median(gaps))
+
+    tremor_bound = tremor_ref_share = None
+    if args.tremor_weight > 0 and args.f0_reference:
+        ref_t, _ = librosa.load(args.f0_reference, sr=KOKORO_SR, mono=True)
+        share = tremor_reference(ref_t)
+        tremor_ref_share = share
+        log(f"Reference tremor: {100*share:.1f}% of pitch modulation in 3-10 Hz")
+
     subharmonic_bound = None
     if args.subharmonic_weight > 0 and args.f0_reference:
         ref_sh, _ = librosa.load(args.f0_reference, sr=KOKORO_SR, mono=True)
@@ -1016,6 +1094,9 @@ def main() -> int:
         f0_target=f0_target,
         f0_weight=args.f0_weight,
         f0_range_weight=args.f0_range_weight,
+        tremor_weight=args.tremor_weight,
+        tremor_bound=tremor_bound,
+        tremor_ref_share=tremor_ref_share,
         pitch_band=pitch_band,
         contour_target=contour_target,
         contour_weight=args.contour_weight,
@@ -1027,6 +1108,8 @@ def main() -> int:
         duration_spread_weight=args.duration_spread_weight,
         noise_floor_weight=args.noise_floor_weight,
         punctuation_weight=args.punctuation_weight,
+        pause_reference=pause_reference,
+        pause_base=pause_base,
         subharmonic_weight=args.subharmonic_weight,
         subharmonic_bound=subharmonic_bound,
         energy_target=energy_target,
