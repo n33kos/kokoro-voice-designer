@@ -390,7 +390,7 @@ def invert(
                 mm = m[:d.numel()]
                 if int(mm.sum()):
                     entry.append((m, float(d[mm].mean())))
-            punctuation_targets[text] = [(m, t * pause_scale) for m, t in entry]
+            punctuation_targets[text] = entry
             boundary_targets[text] = float(d[0])
         shown = [f"{t * 600 / KOKORO_SR * 1000:.0f}ms"
                  for e in punctuation_targets.values() for _, t in e]
@@ -540,6 +540,43 @@ def invert(
         levels = np.asarray(F0_DENSE_QUANTILES, dtype=np.float64)
         fit = np.polyfit(levels, raw, 2)
         f0_offset = list(np.polyval(fit, levels))
+
+        # Every *bridge* between two measurement domains has to be re-measured on
+        # the current voice, not fixed at step 0 from the base voice. Measured
+        # consequence of getting this wrong: a 1.50x pause scale and a tremor
+        # hinge, both calibrated once, left one voice's gaps *shrinking* (319 ->
+        # 288 ms against a 525 ms target) and its tremor *rising* (9.2 -> 10.1%
+        # against 5.4%), because by the end of the run the voice had moved far
+        # enough that the step-0 mappings no longer held. The pitch offset never
+        # had this problem precisely because it recalibrates.
+        #
+        # A fixed *reference value* is different and stays fixed: duration
+        # spread, the leading-token length and the noise-floor bound are all
+        # measured in the same domain on both sides, so they need no bridge.
+        nonlocal pause_scale, tremor_bound
+        if pause_reference is not None:
+            cur = []
+            for _, ps, ctx in contexts:
+                torch.manual_seed(SEED)
+                with torch.no_grad():
+                    o = diff.forward(ctx, params.row(len(ps)))
+                cur.extend(pitch.silent_gaps(o.audio.detach().cpu().numpy(),
+                                             KOKORO_SR).tolist())
+            if len(cur) >= 3:
+                now = float(np.median(cur))
+                pause_scale = float(np.clip(pause_scale * (pause_reference / now),
+                                            0.75, 4.0))
+        if tremor_weight > 0 and tremor_ref_share is not None:
+            ratios = []
+            for _, ps, ctx in contexts:
+                torch.manual_seed(SEED)
+                with torch.no_grad():
+                    o = diff.forward(ctx, params.row(len(ps)))
+                rend = tremor_reference(o.audio.detach().cpu().numpy(), KOKORO_SR)
+                if rend > 1e-6:
+                    ratios.append(float(tremor_share(o.f0_pred, voiced_cut)) / rend)
+            if ratios:
+                tremor_bound = tremor_ref_share * 1.15 * float(np.median(ratios))
         return f0_offset
 
     for step in range(start_step, steps):
@@ -617,7 +654,12 @@ def invert(
                 totals["contour"] += float(lct)
 
             if creak_target is not None and creak_weight > 0:
-                lc = creak_fraction_loss(out.f0_pred, creak_target[0], creak_target[1])
+                # Rendered-Hz threshold -> internal domain, using the same
+                # calibration the distribution match uses. Without this the cut
+                # sits up to 20% off, since internal and rendered pitch differ by
+                # that much.
+                thr = creak_target[1] * float(np.exp(f0_offset[len(f0_offset) // 2]))
+                lc = creak_fraction_loss(out.f0_pred, creak_target[0], thr)
                 loss = loss + creak_weight * lc
                 totals["creak"] += float(lc)
 
@@ -642,7 +684,8 @@ def invert(
                 totals["energy"] += float(le)
 
             if punctuation_weight > 0 and punctuation_targets.get(text):
-                lpn = (punctuation_duration_loss(out.duration, punctuation_targets[text])
+                scaled = [(m, t * pause_scale) for m, t in punctuation_targets[text]]
+                lpn = (punctuation_duration_loss(out.duration, scaled)
                        + boundary_duration_loss(out.duration, boundary_targets[text]))
                 loss = loss + punctuation_weight * lpn
                 totals["punct"] += float(lpn)
@@ -690,7 +733,8 @@ def invert(
         if punctuation_weight > 0 and long_ctx is not None:
             lo = diff.forward(long_ctx, params.row(len(long_ctx.phonemes)),
                               decode=False)
-            llp = (punctuation_duration_loss(lo.duration, long_targets)
+            llp = (punctuation_duration_loss(
+                       lo.duration, [(m, t * pause_scale) for m, t in long_targets])
                    + boundary_duration_loss(lo.duration, long_boundary)
                    + duration_spread_loss(lo.duration, long_ctx.phoneme_mask,
                                           long_spread))
