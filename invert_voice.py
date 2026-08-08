@@ -302,6 +302,7 @@ def invert(
     energy_target: float | None = None,
     energy_weight: float = 0.0,
     duration_weight: float = 0.0,
+    constraint_start: float = 0.0,
     duration_min_frames: float = 2.0,
     pause_weight: float = 0.0,
     pause_reference: float | None = None,
@@ -496,6 +497,8 @@ def invert(
             tremor_bound = None
 
 
+    calibrating_constraints = False
+
     def recalibrate(f0_target):
         """Shift the F0 target so rendered pitch, not F0_pred, hits the mark.
 
@@ -554,6 +557,14 @@ def invert(
         # spread, the leading-token length and the noise-floor bound are all
         # measured in the same domain on both sides, so they need no bridge.
         nonlocal pause_scale, tremor_bound
+        # Only while the constraint is actually applied, and never by more than
+        # 25% at a time. This is proportional control: the update multiplies the
+        # scale by (target / current). If the term is switched off, or if the
+        # response lags, `current` never moves and the scale winds up to its
+        # ceiling — which is what produced a single 1288 ms pause in one voice
+        # while its other pauses stayed short.
+        if not calibrating_constraints:
+            return f0_offset
         if pause_reference is not None:
             cur = []
             for _, ps, ctx in contexts:
@@ -564,8 +575,8 @@ def invert(
                                              KOKORO_SR).tolist())
             if len(cur) >= 3:
                 now = float(np.median(cur))
-                pause_scale = float(np.clip(pause_scale * (pause_reference / now),
-                                            0.75, 4.0))
+                step_ratio = float(np.clip(pause_reference / now, 0.8, 1.25))
+                pause_scale = float(np.clip(pause_scale * step_ratio, 0.75, 2.5))
         if tremor_weight > 0 and tremor_ref_share is not None:
             ratios = []
             for _, ps, ctx in contexts:
@@ -579,7 +590,23 @@ def invert(
                 tremor_bound = tremor_ref_share * 1.15 * float(np.median(ratios))
         return f0_offset
 
+    # The prosody hinges are barriers: zero once satisfied, but they block
+    # regions of style space while the search is still moving. Measured across
+    # v29-v37, they never exceed 8% of the *final* loss, yet the perceptual
+    # term — the actual "does this sound like the speaker" objective — degraded
+    # from 0.135-0.181 to 0.157-0.225 as they were added. The endpoint balance
+    # was fine; the trajectory was being re-routed into a worse basin.
+    #
+    # So let the voice reach its perceptual optimum first, then switch the
+    # constraints on to repair specific defects from there.
+    gate_step = int(steps * constraint_start)
+    if gate_step > 0:
+        log(f"Prosody constraints held off until step {gate_step} "
+            f"({100*constraint_start:.0f}% of the run)")
+
     for step in range(start_step, steps):
+        constrained = step >= gate_step
+        calibrating_constraints = constrained
         if f0_target is not None and f0_weight > 0 and step % 10 == 0:
             off = recalibrate(f0_target)
             if off is not None and step % 30 == 0:
@@ -643,17 +670,17 @@ def invert(
                 loss = loss + f0_range_weight * lr
                 totals["f0range"] += float(lr)
 
-            if tremor_weight > 0 and tremor_bound is not None:
+            if constrained and tremor_weight > 0 and tremor_bound is not None:
                 lt = tremor_loss(out.f0_pred, tremor_bound, voiced_cut)
                 loss = loss + tremor_weight * lt
                 totals["tremor"] += float(lt)
 
-            if contour_target is not None and contour_weight > 0:
+            if constrained and contour_target is not None and contour_weight > 0:
                 lct = f0_contour_loss(out.f0_pred, contour_target, voiced_cut)
                 loss = loss + contour_weight * lct
                 totals["contour"] += float(lct)
 
-            if creak_target is not None and creak_weight > 0:
+            if constrained and creak_target is not None and creak_weight > 0:
                 # Rendered-Hz threshold -> internal domain, using the same
                 # calibration the distribution match uses. Without this the cut
                 # sits up to 20% off, since internal and rendered pitch differ by
@@ -663,18 +690,18 @@ def invert(
                 loss = loss + creak_weight * lc
                 totals["creak"] += float(lc)
 
-            if pause_weight > 0 and text in pause_targets:
+            if constrained and pause_weight > 0 and text in pause_targets:
                 lpa = pause_share_loss(out.duration, ctx.pause_mask,
                                        pause_targets[text])
                 loss = loss + pause_weight * lpa
                 totals["pause"] += float(lpa)
 
-            if declination_target is not None and declination_weight > 0:
+            if constrained and declination_target is not None and declination_weight > 0:
                 ldec = declination_loss(out.f0_pred, declination_target, voiced_cut)
                 loss = loss + declination_weight * ldec
                 totals["declination"] += float(ldec)
 
-            if energy_target is not None and energy_weight > 0:
+            if constrained and energy_target is not None and energy_weight > 0:
                 # Deadband on how much loudness moves, plus a barrier against
                 # the internal energy contour inverting. Both are zero on a
                 # healthy voice, so neither can perturb one that is already right.
@@ -683,25 +710,25 @@ def invert(
                 loss = loss + energy_weight * le
                 totals["energy"] += float(le)
 
-            if punctuation_weight > 0 and punctuation_targets.get(text):
+            if constrained and punctuation_weight > 0 and punctuation_targets.get(text):
                 scaled = [(m, t * pause_scale) for m, t in punctuation_targets[text]]
                 lpn = (punctuation_duration_loss(out.duration, scaled)
                        + boundary_duration_loss(out.duration, boundary_targets[text]))
                 loss = loss + punctuation_weight * lpn
                 totals["punct"] += float(lpn)
 
-            if subharmonic_weight > 0 and subharmonic_bound is not None:
+            if constrained and subharmonic_weight > 0 and subharmonic_bound is not None:
                 lsh = subharmonic_loss(out.audio, subharmonic_bound[0],
                                        subharmonic_bound[1])
                 loss = loss + subharmonic_weight * lsh
                 totals["subharm"] += float(lsh)
 
-            if noise_floor_weight > 0 and text in noise_floor_bounds:
+            if constrained and noise_floor_weight > 0 and text in noise_floor_bounds:
                 lnf = noise_floor_loss(out.audio, noise_floor_bounds[text])
                 loss = loss + noise_floor_weight * lnf
                 totals["floor"] += float(lnf)
 
-            if duration_spread_weight > 0 and text in duration_spread_targets:
+            if constrained and duration_spread_weight > 0 and text in duration_spread_targets:
                 lds = duration_spread_loss(out.duration, ctx.phoneme_mask,
                                            duration_spread_targets[text])
                 loss = loss + duration_spread_weight * lds
@@ -730,7 +757,7 @@ def invert(
         # per text, and backwarded on its own like the manifold penalty. The
         # defect lives past the trained rows, so it has to be measured there.
         # `decode=False` skips the vocoder, which is where the memory goes.
-        if punctuation_weight > 0 and long_ctx is not None:
+        if constrained and punctuation_weight > 0 and long_ctx is not None:
             lo = diff.forward(long_ctx, params.row(len(long_ctx.phonemes)),
                               decode=False)
             llp = (punctuation_duration_loss(
@@ -806,6 +833,9 @@ def main() -> int:
     ap.add_argument("--duration-spread-weight", type=float, default=0.0,
                     help="Weight on keeping phoneme-length variation where the "
                          "base voice had it")
+    ap.add_argument("--constraint-start", type=float, default=0.0,
+                    help="Fraction of the run to optimize voice match alone "
+                         "before the prosody constraints engage (0 = always on)")
     ap.add_argument("--tremor-weight", type=float, default=0.0,
                     help="Weight on keeping 3-10 Hz pitch wobble no worse than "
                          "the reference speaker's")
@@ -1159,6 +1189,7 @@ def main() -> int:
         energy_target=energy_target,
         energy_weight=args.energy_weight,
         duration_weight=args.duration_weight,
+        constraint_start=args.constraint_start,
         duration_min_frames=args.duration_min_frames,
         bounds=bounds,
         ground_truth=ground_truth,
