@@ -304,6 +304,7 @@ def invert(
     duration_weight: float = 0.0,
     constraint_start: float = 0.0,
     trust_weight: float = 0.0,
+    constraint_ramp: float = 0.0,
     duration_min_frames: float = 2.0,
     pause_weight: float = 0.0,
     pause_reference: float | None = None,
@@ -613,8 +614,16 @@ def invert(
     # perceptual optimum, before any prosody repair.
     anchor = None
 
+    ramp_steps = max(1, int(steps * constraint_ramp))
+
     for step in range(start_step, steps):
         constrained = step >= gate_step
+        # Ease the constraints in. Switched on at full strength they totalled
+        # ~2.7 against a perceptual of 0.159 — seventeen times larger — which
+        # kicks the voice out of the basin the warm-up found within a few steps,
+        # after which no trust penalty can pull it back. Perceptual was measured
+        # climbing 0.159 -> 0.191 over the 60 steps that followed.
+        ramp = min(1.0, (step - gate_step + 1) / ramp_steps) if constrained else 0.0
         if constrained and anchor is None and trust_weight > 0:
             anchor = params.voice().detach().clone()
             log(f"Trust region anchored at step {step}")
@@ -684,12 +693,12 @@ def invert(
 
             if constrained and tremor_weight > 0 and tremor_bound is not None:
                 lt = tremor_loss(out.f0_pred, tremor_bound, voiced_cut)
-                loss = loss + tremor_weight * lt
+                loss = loss + ramp * tremor_weight * lt
                 totals["tremor"] += float(lt)
 
             if constrained and contour_target is not None and contour_weight > 0:
                 lct = f0_contour_loss(out.f0_pred, contour_target, voiced_cut)
-                loss = loss + contour_weight * lct
+                loss = loss + ramp * contour_weight * lct
                 totals["contour"] += float(lct)
 
             if constrained and creak_target is not None and creak_weight > 0:
@@ -699,18 +708,18 @@ def invert(
                 # that much.
                 thr = creak_target[1] * float(np.exp(f0_offset[len(f0_offset) // 2]))
                 lc = creak_fraction_loss(out.f0_pred, creak_target[0], thr)
-                loss = loss + creak_weight * lc
+                loss = loss + ramp * creak_weight * lc
                 totals["creak"] += float(lc)
 
             if constrained and pause_weight > 0 and text in pause_targets:
                 lpa = pause_share_loss(out.duration, ctx.pause_mask,
                                        pause_targets[text])
-                loss = loss + pause_weight * lpa
+                loss = loss + ramp * pause_weight * lpa
                 totals["pause"] += float(lpa)
 
             if constrained and declination_target is not None and declination_weight > 0:
                 ldec = declination_loss(out.f0_pred, declination_target, voiced_cut)
-                loss = loss + declination_weight * ldec
+                loss = loss + ramp * declination_weight * ldec
                 totals["declination"] += float(ldec)
 
             if constrained and energy_target is not None and energy_weight > 0:
@@ -719,7 +728,7 @@ def invert(
                 # healthy voice, so neither can perturb one that is already right.
                 le = (energy_range_loss(out.audio, energy_target)
                       + energy_sign_loss(out.n_pred))
-                loss = loss + energy_weight * le
+                loss = loss + ramp * energy_weight * le
                 totals["energy"] += float(le)
 
             if constrained and punctuation_weight > 0 and punctuation_targets.get(text):
@@ -727,24 +736,24 @@ def invert(
                           for i, (m, t) in enumerate(punctuation_targets[text])]
                 lpn = (punctuation_duration_loss(out.duration, scaled)
                        + boundary_duration_loss(out.duration, boundary_targets[text]))
-                loss = loss + punctuation_weight * lpn
+                loss = loss + ramp * punctuation_weight * lpn
                 totals["punct"] += float(lpn)
 
             if constrained and subharmonic_weight > 0 and subharmonic_bound is not None:
                 lsh = subharmonic_loss(out.audio, subharmonic_bound[0],
                                        subharmonic_bound[1])
-                loss = loss + subharmonic_weight * lsh
+                loss = loss + ramp * subharmonic_weight * lsh
                 totals["subharm"] += float(lsh)
 
             if constrained and noise_floor_weight > 0 and text in noise_floor_bounds:
                 lnf = noise_floor_loss(out.audio, noise_floor_bounds[text])
-                loss = loss + noise_floor_weight * lnf
+                loss = loss + ramp * noise_floor_weight * lnf
                 totals["floor"] += float(lnf)
 
             if constrained and duration_spread_weight > 0 and text in duration_spread_targets:
                 lds = duration_spread_loss(out.duration, ctx.phoneme_mask,
                                            duration_spread_targets[text])
-                loss = loss + duration_spread_weight * lds
+                loss = loss + ramp * duration_spread_weight * lds
                 totals["durspread"] += float(lds)
 
             # Lengthen phonemes Kokoro swallows, without slowing everything.
@@ -790,7 +799,7 @@ def invert(
                    + boundary_duration_loss(lo.duration, long_boundary)
                    + duration_spread_loss(lo.duration, long_ctx.phoneme_mask,
                                           long_spread))
-            (punctuation_weight * llp).backward()
+            (ramp * punctuation_weight * llp).backward()
             totals["punct"] += float(llp) * len(contexts)
 
         torch.nn.utils.clip_grad_norm_(params.parameters(), 1.0)
@@ -858,6 +867,9 @@ def main() -> int:
     ap.add_argument("--duration-spread-weight", type=float, default=0.0,
                     help="Weight on keeping phoneme-length variation where the "
                          "base voice had it")
+    ap.add_argument("--constraint-ramp", type=float, default=0.15,
+                    help="Fraction of the run over which the prosody constraints "
+                         "fade in once they engage")
     ap.add_argument("--trust-weight", type=float, default=0.0,
                     help="Penalty on drifting from the voice match found before "
                          "the prosody constraints engaged")
@@ -1225,6 +1237,7 @@ def main() -> int:
         energy_weight=args.energy_weight,
         duration_weight=args.duration_weight,
         constraint_start=args.constraint_start,
+        constraint_ramp=args.constraint_ramp,
         trust_weight=args.trust_weight,
         duration_min_frames=args.duration_min_frames,
         bounds=bounds,
