@@ -341,7 +341,7 @@ def invert(
     punctuation_targets = {}
     boundary_targets = {}
     long_ctx = None
-    pause_scale = 1.0
+    pause_scale = [1.0, 1.0]
     if punctuation_weight > 0:
         # The base voice maps token duration to rendered silence; the reference
         # supplies the target. Targeting the base voice alone cannot reach it —
@@ -359,9 +359,10 @@ def invert(
                                                KOKORO_SR).tolist())
         pause_base = float(np.median(base_gaps)) if len(base_gaps) >= 3 else None
         if pause_reference is not None and pause_base:
-            pause_scale = float(np.clip(pause_reference / pause_base, 0.75, 2.5))
-            log(f"Pause scale toward the reference speaker: {pause_scale:.2f}x "
-                f"(speaker {pause_reference:.0f}ms, base voice {pause_base:.0f}ms)")
+            pause_scale = [float(np.clip(r / pause_base, 0.75, 2.5))
+                           for r in pause_reference]
+            log(f"Pause scale: {pause_scale[0]:.2f}x at sentence ends, "
+                f"{pause_scale[1]:.2f}x at commas (base voice {pause_base:.0f}ms)")
         # The defect appears past the trained rows, so constrain a long passage
         # too. Duration-only, so no vocoder and no meaningful memory cost.
         long_ps = diff.phonemize(pipeline, LONG_PACING_TEXT)
@@ -575,8 +576,11 @@ def invert(
                                              KOKORO_SR).tolist())
             if len(cur) >= 3:
                 now = float(np.median(cur))
-                step_ratio = float(np.clip(pause_reference / now, 0.8, 1.25))
-                pause_scale = float(np.clip(pause_scale * step_ratio, 0.75, 2.5))
+                # One observable (the rendered gap distribution) drives both
+                # scales, so nudge them together and keep their ratio.
+                step_ratio = float(np.clip(pause_reference[0] / now, 0.8, 1.25))
+                pause_scale = [float(np.clip(x * step_ratio, 0.75, 2.5))
+                               for x in pause_scale]
         if tremor_weight > 0 and tremor_ref_share is not None:
             ratios = []
             for _, ps, ctx in contexts:
@@ -711,7 +715,8 @@ def invert(
                 totals["energy"] += float(le)
 
             if constrained and punctuation_weight > 0 and punctuation_targets.get(text):
-                scaled = [(m, t * pause_scale) for m, t in punctuation_targets[text]]
+                scaled = [(m, t * pause_scale[i])
+                          for i, (m, t) in enumerate(punctuation_targets[text])]
                 lpn = (punctuation_duration_loss(out.duration, scaled)
                        + boundary_duration_loss(out.duration, boundary_targets[text]))
                 loss = loss + punctuation_weight * lpn
@@ -761,7 +766,8 @@ def invert(
             lo = diff.forward(long_ctx, params.row(len(long_ctx.phonemes)),
                               decode=False)
             llp = (punctuation_duration_loss(
-                       lo.duration, [(m, t * pause_scale) for m, t in long_targets])
+                       lo.duration, [(m, t * pause_scale[i])
+                                     for i, (m, t) in enumerate(long_targets)])
                    + boundary_duration_loss(lo.duration, long_boundary)
                    + duration_spread_loss(lo.duration, long_ctx.phoneme_mask,
                                           long_spread))
@@ -1106,7 +1112,14 @@ def main() -> int:
         ref_p, _ = librosa.load(args.f0_reference, sr=KOKORO_SR, mono=True)
         gaps = pitch.silent_gaps(ref_p, KOKORO_SR)
         if len(gaps) >= 3:
-            pause_reference = float(np.median(gaps))
+            # Separate targets per punctuation class. A single median is
+            # dominated by sentence-level pauses, and applying it to commas
+            # stretched them 71 -> 175 ms, which reads as a sentence break.
+            pause_reference = (float(np.percentile(gaps, 70)),
+                               float(np.percentile(gaps, 25)))
+            log(f"Reference gaps: {pause_reference[0]:.0f}ms at sentence ends, "
+                f"{pause_reference[1]:.0f}ms at commas (median "
+                f"{np.median(gaps):.0f}ms over {len(gaps)} gaps)")
 
     tremor_bound = tremor_ref_share = None
     if args.tremor_weight > 0 and args.f0_reference:
