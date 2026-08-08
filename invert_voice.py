@@ -303,6 +303,7 @@ def invert(
     energy_weight: float = 0.0,
     duration_weight: float = 0.0,
     constraint_start: float = 0.0,
+    trust_weight: float = 0.0,
     duration_min_frames: float = 2.0,
     pause_weight: float = 0.0,
     pause_reference: float | None = None,
@@ -608,8 +609,15 @@ def invert(
         log(f"Prosody constraints held off until step {gate_step} "
             f"({100*constraint_start:.0f}% of the run)")
 
+    # Style vector at the moment the constraints engage — the voice's own
+    # perceptual optimum, before any prosody repair.
+    anchor = None
+
     for step in range(start_step, steps):
         constrained = step >= gate_step
+        if constrained and anchor is None and trust_weight > 0:
+            anchor = params.voice().detach().clone()
+            log(f"Trust region anchored at step {step}")
         calibrating_constraints = constrained
         if f0_target is not None and f0_weight > 0 and step % 10 == 0:
             off = recalibrate(f0_target)
@@ -622,7 +630,7 @@ def invert(
         # the shared objective. Accumulating over all texts makes each step a
         # genuine descent direction.
         opt.zero_grad()
-        totals = {"perceptual": 0.0, "pacing": 0.0, "speaker": 0.0, "f0": 0.0, "f0range": 0.0, "tremor": 0.0, "contour": 0.0, "creak": 0.0, "declination": 0.0, "pause": 0.0, "durspread": 0.0, "floor": 0.0, "punct": 0.0, "subharm": 0.0, "energy": 0.0, "dur": 0.0}
+        totals = {"perceptual": 0.0, "pacing": 0.0, "speaker": 0.0, "f0": 0.0, "f0range": 0.0, "tremor": 0.0, "contour": 0.0, "creak": 0.0, "declination": 0.0, "pause": 0.0, "durspread": 0.0, "floor": 0.0, "punct": 0.0, "subharm": 0.0, "energy": 0.0, "dur": 0.0, "trust": 0.0}
         total_loss = 0.0
 
         for text, ps, ctx in contexts:
@@ -749,6 +757,17 @@ def invert(
             (loss / len(contexts)).backward()
             total_loss += float(loss) / len(contexts)
 
+        # Trust region. Removing constraints did not buy back voice match
+        # (dropping two of eleven moved perceptual 0.200 -> 0.179 on one voice
+        # and 0.191 -> 0.238 on another), so the cost is not the barrier count —
+        # it is how far the repair phase drags the voice from the optimum it had
+        # already found. Penalise that distance directly instead of guessing
+        # which constraint to remove.
+        if trust_weight > 0 and anchor is not None:
+            drift = torch.nn.functional.mse_loss(params.voice(), anchor)
+            (trust_weight * drift).backward()
+            totals["trust"] = float(drift) * len(contexts)
+
         if reg_weight > 0 and bounds is not None:
             # Hinge penalty on leaving the per-dimension range spanned by the
             # built-in voices. Zero inside the box, so it costs nothing until the
@@ -839,6 +858,9 @@ def main() -> int:
     ap.add_argument("--duration-spread-weight", type=float, default=0.0,
                     help="Weight on keeping phoneme-length variation where the "
                          "base voice had it")
+    ap.add_argument("--trust-weight", type=float, default=0.0,
+                    help="Penalty on drifting from the voice match found before "
+                         "the prosody constraints engaged")
     ap.add_argument("--constraint-start", type=float, default=0.0,
                     help="Fraction of the run to optimize voice match alone "
                          "before the prosody constraints engage (0 = always on)")
@@ -1203,6 +1225,7 @@ def main() -> int:
         energy_weight=args.energy_weight,
         duration_weight=args.duration_weight,
         constraint_start=args.constraint_start,
+        trust_weight=args.trust_weight,
         duration_min_frames=args.duration_min_frames,
         bounds=bounds,
         ground_truth=ground_truth,
