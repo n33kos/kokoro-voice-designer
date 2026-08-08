@@ -274,6 +274,56 @@ def tremor_loss(f0_pred: torch.Tensor, max_share: float,
     return ((share - max_share).clamp(min=0.0) / max(max_share, 1e-6)) ** 2
 
 
+def interharmonic_energy(audio: torch.Tensor, f0_hz: float,
+                         sr: int = KOKORO_SR) -> torch.Tensor:
+    """Energy sitting *between* the harmonics, relative to energy on them.
+
+    Clean phonation puts nearly everything on multiples of f0; what lands in the
+    gaps is noise or intermodulation, which is what roughness is made of.
+
+    **The perceptual weight of this depends on register, so the bound must come
+    from the speaker's own reference.** Measured across four voices, the highest
+    reading belonged to a 228 Hz voice a listener called clean (136.3% against a
+    110.7% reference), while an 82 Hz voice at 127.9% against 115.5% was
+    described as "grainy... kind of robotic". At 228 Hz the harmonics are far
+    apart and this energy reads as mild breathiness; at 82 Hz they are packed and
+    it fills the gaps. Same number, different sound.
+
+    Differentiable through `torch.stft`.
+    """
+    x = audio.squeeze()
+    n_fft = 4096
+    if x.numel() < n_fft or f0_hz <= 0:
+        return x.sum() * 0.0
+    window = torch.hann_window(n_fft, device=x.device, dtype=x.dtype)
+    spec = torch.stft(x, n_fft=n_fft, hop_length=512, window=window,
+                      return_complex=True).abs()
+    freqs = torch.linspace(0, sr / 2, spec.shape[0], device=x.device, dtype=x.dtype)
+    on = torch.zeros_like(freqs, dtype=torch.bool)
+    between = torch.zeros_like(on)
+    for k in range(1, int(3500 / f0_hz) + 1):
+        c = k * f0_hz
+        on |= (freqs > c - f0_hz * 0.15) & (freqs < c + f0_hz * 0.15)
+        between |= (freqs > c + f0_hz * 0.30) & (freqs < c + f0_hz * 0.70)
+    if not bool(on.any()) or not bool(between.any()):
+        return x.sum() * 0.0
+    return spec[between].sum() / spec[on].sum().clamp(min=1e-9)
+
+
+def interharmonic_reference(audio: np.ndarray, f0_hz: float,
+                            sr: int = KOKORO_SR) -> float:
+    with torch.no_grad():
+        return float(interharmonic_energy(
+            torch.from_numpy(np.asarray(audio, dtype=np.float32)), f0_hz, sr))
+
+
+def interharmonic_loss(audio: torch.Tensor, f0_hz: float, max_ratio: float,
+                       sr: int = KOKORO_SR) -> torch.Tensor:
+    """Hinge on inter-harmonic noise. Free up to the speaker's own level."""
+    got = interharmonic_energy(audio, f0_hz, sr)
+    return ((got - max_ratio).clamp(min=0.0) / max(max_ratio, 1e-6)) ** 2
+
+
 def f0_reference_distribution(audio: np.ndarray, sr: int = KOKORO_SR,
                               band: tuple[float, float] | None = None) -> list[float]:
     """Densely sampled log-F0 quantiles — the distribution-matching target."""

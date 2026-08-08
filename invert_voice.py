@@ -73,6 +73,8 @@ from core.perceptual_loss import (
     tremor_loss,
     tremor_reference,
     tremor_share,
+    interharmonic_loss,
+    interharmonic_reference,
     voiced_threshold_for,
     f0_reference_distribution,
     pacing_loss,
@@ -291,6 +293,8 @@ def invert(
     f0_weight: float = 0.0,
     f0_range_weight: float = 0.0,
     tremor_weight: float = 0.0,
+    grain_weight: float = 0.0,
+    grain_bound: tuple[float, float] | None = None,
     tremor_bound: float | None = None,
     tremor_ref_share: float | None = None,
     contour_target: tuple[float, float] | None = None,
@@ -639,7 +643,7 @@ def invert(
         # the shared objective. Accumulating over all texts makes each step a
         # genuine descent direction.
         opt.zero_grad()
-        totals = {"perceptual": 0.0, "pacing": 0.0, "speaker": 0.0, "f0": 0.0, "f0range": 0.0, "tremor": 0.0, "contour": 0.0, "creak": 0.0, "declination": 0.0, "pause": 0.0, "durspread": 0.0, "floor": 0.0, "punct": 0.0, "subharm": 0.0, "energy": 0.0, "dur": 0.0, "trust": 0.0}
+        totals = {"perceptual": 0.0, "pacing": 0.0, "speaker": 0.0, "f0": 0.0, "f0range": 0.0, "tremor": 0.0, "contour": 0.0, "creak": 0.0, "declination": 0.0, "pause": 0.0, "durspread": 0.0, "floor": 0.0, "punct": 0.0, "subharm": 0.0, "energy": 0.0, "dur": 0.0, "trust": 0.0, "grain": 0.0}
         total_loss = 0.0
 
         for text, ps, ctx in contexts:
@@ -690,6 +694,11 @@ def invert(
                 lr = f0_range_loss(out.f0_pred, f0_target, offset=f0_offset)
                 loss = loss + f0_range_weight * lr
                 totals["f0range"] += float(lr)
+
+            if constrained and grain_weight > 0 and grain_bound is not None:
+                lg_ = interharmonic_loss(out.audio, grain_bound[0], grain_bound[1])
+                loss = loss + ramp * grain_weight * lg_
+                totals["grain"] += float(lg_)
 
             if constrained and tremor_weight > 0 and tremor_bound is not None:
                 lt = tremor_loss(out.f0_pred, tremor_bound, voiced_cut)
@@ -876,6 +885,9 @@ def main() -> int:
     ap.add_argument("--constraint-start", type=float, default=0.0,
                     help="Fraction of the run to optimize voice match alone "
                          "before the prosody constraints engage (0 = always on)")
+    ap.add_argument("--grain-weight", type=float, default=0.0,
+                    help="Weight on keeping inter-harmonic noise no worse than "
+                         "the reference speaker's (audible as graininess)")
     ap.add_argument("--tremor-weight", type=float, default=0.0,
                     help="Weight on keeping 3-10 Hz pitch wobble no worse than "
                          "the reference speaker's")
@@ -1155,6 +1167,15 @@ def main() -> int:
                 f"{pause_reference[1]:.0f}ms at commas (median "
                 f"{np.median(gaps):.0f}ms over {len(gaps)} gaps)")
 
+    grain_bound = None
+    if args.grain_weight > 0 and args.f0_reference:
+        ref_g, _ = librosa.load(args.f0_reference, sr=KOKORO_SR, mono=True)
+        g_f0 = float(np.median(pitch.track(ref_g, KOKORO_SR).values))
+        g_ref = interharmonic_reference(ref_g, g_f0)
+        grain_bound = (g_f0, g_ref * 1.05)
+        log(f"Grain bound: {100*grain_bound[1]:.0f}% inter-harmonic at "
+            f"f0 {g_f0:.0f} Hz (reference sits at {100*g_ref:.0f}%)")
+
     tremor_bound = tremor_ref_share = None
     if args.tremor_weight > 0 and args.f0_reference:
         ref_t, _ = librosa.load(args.f0_reference, sr=KOKORO_SR, mono=True)
@@ -1216,6 +1237,8 @@ def main() -> int:
         f0_weight=args.f0_weight,
         f0_range_weight=args.f0_range_weight,
         tremor_weight=args.tremor_weight,
+        grain_weight=args.grain_weight,
+        grain_bound=grain_bound,
         tremor_bound=tremor_bound,
         tremor_ref_share=tremor_ref_share,
         pitch_band=pitch_band,
