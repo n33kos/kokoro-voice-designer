@@ -324,6 +324,39 @@ def interharmonic_loss(audio: torch.Tensor, f0_hz: float, max_ratio: float,
     return ((got - max_ratio).clamp(min=0.0) / max(max_ratio, 1e-6)) ** 2
 
 
+def f0_median_loss(f0_pred: torch.Tensor, target: list[float],
+                   offset: list[float] | None = None,
+                   voiced_threshold: float | None = None,
+                   tolerance: float = 0.02) -> torch.Tensor:
+    """Pin the median, which the distribution match leaves 5-6% adrift.
+
+    The median is the pitch a listener hears as the speaker's register, and it
+    gets one twenty-fifth of the weight in `f0_distribution_loss`. Measured on
+    one voice: internal median 91.3 Hz against a 90.3 Hz target — the loss is
+    hitting its mark exactly — while the rendered median comes out at 85.3. The
+    residual lives in the internal-to-rendered calibration, whose ratio moved
+    from 1.042 to 0.935 across versions of the same voice.
+
+    This matters beyond pitch accuracy: graininess worsens as f0 drops, because
+    the harmonics pack tighter and inter-harmonic noise fills the gaps between
+    them. Placing a speaker below where he actually speaks may manufacture the
+    roughness.
+
+    A 2% deadband, comfortably inside the ~5% run-to-run scatter.
+    """
+    if voiced_threshold is None:
+        voiced_threshold = voiced_threshold_for(target)
+    f0 = f0_pred.squeeze()
+    voiced = f0[internal_voiced_mask(f0, voiced_threshold)]
+    if voiced.numel() < 8:
+        return f0.sum() * 0.0
+    mid = len(target) // 2
+    want = target[mid] + (offset[mid] if offset is not None else 0.0)
+    got = torch.quantile(torch.log(voiced.clamp(min=1.0)),
+                         torch.tensor(0.5, device=f0.device, dtype=f0.dtype))
+    return ((got - want).abs() - tolerance).clamp(min=0.0) ** 2
+
+
 def f0_reference_distribution(audio: np.ndarray, sr: int = KOKORO_SR,
                               band: tuple[float, float] | None = None) -> list[float]:
     """Densely sampled log-F0 quantiles — the distribution-matching target."""

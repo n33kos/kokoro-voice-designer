@@ -70,6 +70,7 @@ from core.perceptual_loss import (
     declination_reference,
     f0_distribution_loss,
     f0_range_loss,
+    f0_median_loss,
     tremor_loss,
     tremor_reference,
     tremor_share,
@@ -292,6 +293,7 @@ def invert(
     pitch_band: tuple[float, float] = (50.0, 400.0),
     f0_weight: float = 0.0,
     f0_range_weight: float = 0.0,
+    f0_median_weight: float = 0.0,
     tremor_weight: float = 0.0,
     grain_weight: float = 0.0,
     grain_bound: tuple[float, float] | None = None,
@@ -643,7 +645,7 @@ def invert(
         # the shared objective. Accumulating over all texts makes each step a
         # genuine descent direction.
         opt.zero_grad()
-        totals = {"perceptual": 0.0, "pacing": 0.0, "speaker": 0.0, "f0": 0.0, "f0range": 0.0, "tremor": 0.0, "contour": 0.0, "creak": 0.0, "declination": 0.0, "pause": 0.0, "durspread": 0.0, "floor": 0.0, "punct": 0.0, "subharm": 0.0, "energy": 0.0, "dur": 0.0, "trust": 0.0, "grain": 0.0}
+        totals = {"perceptual": 0.0, "pacing": 0.0, "speaker": 0.0, "f0": 0.0, "f0range": 0.0, "f0med": 0.0, "tremor": 0.0, "contour": 0.0, "creak": 0.0, "declination": 0.0, "pause": 0.0, "durspread": 0.0, "floor": 0.0, "punct": 0.0, "subharm": 0.0, "energy": 0.0, "dur": 0.0, "trust": 0.0, "grain": 0.0}
         total_loss = 0.0
 
         for text, ps, ctx in contexts:
@@ -691,6 +693,11 @@ def invert(
                 totals["f0"] += float(lf)
 
                 # The distribution mean cannot feel a tail error; this can.
+                if f0_median_weight > 0:
+                    lm = f0_median_loss(out.f0_pred, f0_target, offset=f0_offset)
+                    loss = loss + f0_median_weight * lm
+                    totals["f0med"] += float(lm)
+
                 lr = f0_range_loss(out.f0_pred, f0_target, offset=f0_offset)
                 loss = loss + f0_range_weight * lr
                 totals["f0range"] += float(lr)
@@ -891,6 +898,9 @@ def main() -> int:
     ap.add_argument("--tremor-weight", type=float, default=0.0,
                     help="Weight on keeping 3-10 Hz pitch wobble no worse than "
                          "the reference speaker's")
+    ap.add_argument("--f0-median-weight", type=float, default=0.0,
+                    help="Weight on pinning the median pitch, which the "
+                         "distribution match leaves adrift")
     ap.add_argument("--f0-range-weight", type=float, default=0.0,
                     help="Weight on keeping the top of the pitch range from "
                          "being compressed")
@@ -1236,6 +1246,7 @@ def main() -> int:
         f0_target=f0_target,
         f0_weight=args.f0_weight,
         f0_range_weight=args.f0_range_weight,
+        f0_median_weight=args.f0_median_weight,
         tremor_weight=args.tremor_weight,
         grain_weight=args.grain_weight,
         grain_bound=grain_bound,
