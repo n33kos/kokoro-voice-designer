@@ -101,10 +101,18 @@ uv run python invert_voice.py \
   --target reference.wav --target-text reference.txt \
   --f0-reference reference.wav \
   --steps 120 --lr 0.02 \
-  --reg-weight 50.0 --speaker-weight 2.0 --f0-weight 5.0 \
-  --pacing-weight 2.0 --energy-weight 2.0 \
+  --reg-weight 50.0 --speaker-weight 2.0 \
+  --f0-weight 5.0 --f0-range-weight 1.5 \
+  --pacing-weight 2.0 --energy-weight 5.0 \
+  --duration-spread-weight 2.0 --creak-weight 3.0 \
+  --tremor-weight 1.5 --punctuation-weight 2.0 \
+  --constraint-start 0.5 --constraint-ramp 0.2 --trust-weight 600 \
   --out output/my_voice.pt
 ```
+
+Those are the settings that produced the best results to date. The three
+scheduling flags at the end matter as much as the weights — see
+[the two-phase schedule](#the-two-phase-schedule).
 
 The starting voice is chosen automatically — whichever built-in already sounds
 most like the reference, by speaker-embedding similarity. Pass `--base` to
@@ -137,22 +145,95 @@ Cost scales linearly with clip count. Three to five clips spanning short to long
 
 ### What the loss terms do
 
-Each exists because a measurement showed the previous version was wrong in a specific way.
+Each exists because a measurement showed a specific defect, and each is a
+**hinge with a deadband** rather than a target: zero cost while the voice is
+already acceptable, so a term cannot perturb a voice that does not have the
+defect it targets. That property is load-bearing — a plain squared error is never
+zero, and one added as a target regressed the one voice that already sounded
+right.
 
 | flag | what it constrains |
 | --- | --- |
 | *(always on)* | WavLM layer-4 pooled statistics — the main "sounds like this voice" term |
 | `--speaker-weight` | Differentiable Resemblyzer embedding. Constrains *identity* where WavLM constrains *texture* |
-| `--reg-weight` | Hinge penalty on leaving the range spanned by the built-in voices. Zero cost inside that range |
-| `--f0-weight` | Matches the reference's log-pitch distribution — register and asymmetry, not just an average |
-| `--pacing-weight` | Matches overall speaking rate |
-| `--energy-weight` | Matches how much loudness varies |
-| `--duration-weight` | Lengthens phonemes Kokoro allocates too little time to. Off by default — it flattened natural timing into staccato |
+| `--reg-weight` | Hinge on leaving the range spanned by the built-in voices. Zero cost inside it |
+| `--f0-weight` | Matches the whole log-pitch distribution across 25 quantiles — register and asymmetry, not an average |
+| `--f0-range-weight` | One-sided hinge on p90/p94/p98. The distribution mean cannot feel a tail error: a 10% miss at p90 contributes 0.0004 |
+| `--pacing-weight` | Overall speaking rate |
+| `--energy-weight` | Spread of frame level in dB on rendered audio, plus a barrier against Kokoro's internal energy contour inverting |
+| `--duration-spread-weight` | Keeps phoneme-length variation where the base voice had it. Without it, `pacing_loss` crushes the longest phonemes and the rhythm flattens |
+| `--creak-weight` | One-sided, log-domain. Keeps frames below the register no more common than in the reference |
+| `--tremor-weight` | Hinge on 3-10 Hz pitch modulation. Nothing else can see a steady wobble — creak counts frames below a threshold, and a tremor sits at the median |
+| `--punctuation-weight` | Keeps pauses at punctuation from being swallowed, with separate targets for sentence ends and commas |
+| `--noise-floor-weight` | Off by default. Improves the quantity it optimizes by up to 63 dB while the audible floor moves 0-3 dB |
+| `--duration-weight` | Off by default — it flattened natural timing into staccato |
 
-Two notes worth knowing:
+### The two-phase schedule
 
-- **With `--speaker-weight` set, Resemblyzer becomes a training target**, so its similarity score is no longer an independent metric. Judge results by ear, and by how far the result strays from the built-in voice range.
-- **Gradient descent will walk the style vector outside the region Kokoro was trained on** if you let it, which sounds like graininess and pitch spiking. That's what `--reg-weight` is for.
+The prosody terms are barriers. They are zero once satisfied, but they block
+regions of style space while the search is still moving, and switched on at full
+strength they total roughly **seventeen times** the perceptual loss. That kicks
+the voice out of the basin it had found: tracked across versions, the WavLM term
+degraded from 0.135-0.181 to 0.157-0.225 as terms were added, while every prosody
+metric improved.
+
+Three flags fix that, and they are worth more than any individual weight:
+
+- `--constraint-start 0.5` — optimize voice match alone for the first half of the
+  run, so the constraints repair rather than steer.
+- `--constraint-ramp 0.2` — fade them in over 20% of the run instead of switching
+  them on, so the voice is never kicked.
+- `--trust-weight 600` — penalize drift from the style vector as it stood when
+  the constraints engaged.
+
+Together these cut the post-engagement loss of voice match from 20% to 5%.
+
+**Track the perceptual term across versions.** Its endpoint alone hides this —
+the curve is what shows the damage, and five versions were spent blaming
+individual terms for a problem that was about how abruptly they arrived.
+
+### Measurement discipline
+
+Nearly every bug in this project has had one shape: **two numbers that look like
+the same measurement and are not.** A loss reports itself satisfied while the
+audio is audibly wrong.
+
+The pitch tracker is the worst case. Every target — register, distribution,
+creak, contour — came from `librosa.yin` masked by a frequency band, which
+reports **8-13% of adjacent voiced frames jumping more than an octave** on real
+recordings. Those octave errors *were* the targets: the creak target asked for
+7-12% of frames below the register when the truth is 0-1%, so the optimizer was
+being asked to produce the croakiness. `core/pitch.py` replaced it with a
+confidence-masked tracker (CREPE, or pyin as fallback). Read that module before
+touching anything pitch-related.
+
+Four rules that came out of it:
+
+1. **Sweep the free parameter before optimizing against a statistic.** A value
+   that changes when you halve the analysis window is not measuring the signal.
+   Frame-to-frame pitch movement read the same at 12.5 ms and 25 ms — the tell
+   that it was tracker noise. Declination was abandoned for the same reason: it
+   moved 13x across segmentation settings.
+2. **Bounds on Kokoro's internal `F0_pred`/`N_pred` need a bridge to the same
+   statistic on rendered audio**, calibrated on the base voice. Those contours
+   are not band-limited like tracked pitch — they ramp from zero at every voicing
+   onset. A tremor bound set from tracked audio came out at 42.7 against a bound
+   of 0.06, i.e. 99% of the objective.
+3. **A bridge decays; a reference value does not.** Anything mapping between two
+   domains must be re-measured on the current voice during the run, the way the
+   pitch offset is. Fixed at step 0, the pause scale and tremor bound both went
+   stale and their terms went quiet on bounds that were no longer true.
+4. **Before running, check a new term reads zero on the voice that already sounds
+   best.** If it is non-zero there, it will move it.
+
+### Reproducibility
+
+Two runs with identical settings differ by **4-5% on every pitch quantile**, and
+39% relative on the style vector. Treat anything smaller than that in a
+single-run comparison as noise. Averaging independent runs helps where the error
+is scatter and not where it is bias — summed quantile error dropped 12.4% → 9.7%
+on one voice and 4.7% → 3.3% on another, while two voices whose p90 was
+reproducibly low were unchanged by it.
 
 ### Why the transcript matters
 
@@ -186,8 +267,9 @@ voice-designer/
 ├── build_voice_registry.py  # Measure built-in voices (base-voice selection)
 ├── synthesize.py            # Quick test synthesis from any .pt voice
 ├── core/
+│   ├── pitch.py                  # The one reference pitch tracker — read first
 │   ├── differentiable_kokoro.py  # Kokoro forward pass with gradients enabled
-│   ├── perceptual_loss.py        # WavLM, pacing, F0 and duration losses
+│   ├── perceptual_loss.py        # WavLM, pitch, energy, duration and pause losses
 │   ├── speaker_loss.py           # Differentiable Resemblyzer + manifold bounds
 │   ├── spectral_features.py      # Differentiable audio features
 │   ├── speech_generator.py       # Kokoro wrapper (seedable)
@@ -199,9 +281,23 @@ voice-designer/
 └── web/                     # React + TypeScript frontend
 ```
 
+### A note on `core/pitch.py`
+
+Every reference pitch measurement in the project goes through it, and its
+docstring explains why: the targets were wrong for a long time because the
+tracker behind them was, and the losses reported success throughout. Anything
+that measures pitch on a recording belongs here, not scattered across call sites
+with its own band and hop.
+
 ### A note on `differentiable_kokoro.py`
 
 Kokoro's `forward_with_tokens` is decorated with `@torch.no_grad()`, which makes gradient-based optimization impossible. That module mirrors those ~30 lines with gradients enabled, and exposes two things the stock path discards: the *continuous* duration before rounding (the only differentiable handle on pacing) and the `F0_pred`/`N_pred` contours.
+
+`forward(..., decode=False)` stops before the vocoder. Peak memory in the
+backward pass is dominated by retained vocoder activations — roughly 0.75 GB per
+second of audio — so duration constraints can be applied at utterance lengths
+that would be far too expensive to render. That is how pauses are constrained at
+a 400-phoneme passage while training on 2-6 second clips.
 
 Since this depends on Kokoro internals rather than a public API, `test_differentiable.py` asserts that under a fixed seed our output is **bit-identical** to stock Kokoro. Run it after upgrading Kokoro.
 
@@ -211,8 +307,19 @@ Since this depends on Kokoro internals rather than a public API, `test_different
 
 - Python 3.11–3.12, `uv`
 - Node 18+ for the web UI
-- ~4GB disk for models (Kokoro, WavLM, Resemblyzer)
+- ~4GB disk for models (Kokoro, WavLM, Resemblyzer, CREPE)
 - Apple Silicon, CUDA or CPU. Voice matching defaults to CPU — the model is small and MPS has gaps in backward-pass coverage.
+
+**Memory:** peak usage is roughly **0.75 GB per second of training audio**, because
+the backward pass retains vocoder activations at 24 kHz. Cost scales with clip
+*duration*, not count — 4.3 s needs ~3.6 GB, 9.7 s needs ~7.3 GB. A 14.6 s clip
+was killed by the OS mid-run, and that failure is silent: the process vanishes
+and a queue script moves on, so it looks as though the run never happened.
+`--max-clip-seconds` (default 10) refuses over-long clips up front. Run one match
+at a time.
+
+`torchcrepe` is optional but recommended — `core/pitch.py` falls back to
+`librosa.pyin`, which is faster but less accurate in the tails.
 
 ---
 
